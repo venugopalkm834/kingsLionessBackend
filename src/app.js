@@ -27,15 +27,14 @@ app.use(cors({
     origin: allowedOrigins,
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization']
+    allowedHeaders: ['Content-Type', 'Authorization', 'Idempotency-Key']
 }));
-
 app.use(express.json({ limit: '1mb' }));
 
 if (process.env.NODE_ENV !== 'test') {
     app.use(morgan('dev'));
 }
-
+require('fs').mkdirSync(path.join(__dirname, '../uploads'), { recursive: true });
 app.use('/uploads', express.static(
     path.join(__dirname, '../uploads'),
     {
