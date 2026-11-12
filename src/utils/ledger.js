@@ -29,6 +29,7 @@ const dailyPercent = (r, d = new Date()) => (r.inputMode === 'monthly' ? (Number
 // Which wallet field the daily earning is calculated on: principal, balance (total) or earned (earning wallet).
 const baseField = (r) => (r?.base === 'balance' || r?.base === 'earned' ? r.base : 'principal');
 const pad = (n) => String(n).padStart(2, '0');
+
 const todayStr = (d = new Date()) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`; // server-local date
 const monthStr = (d = new Date()) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}`;
 const isLastDayOfMonth = (d = new Date()) => new Date(d.getFullYear(), d.getMonth(), d.getDate() + 1).getDate() === 1;
