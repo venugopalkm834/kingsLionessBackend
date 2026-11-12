@@ -61,6 +61,8 @@ r.patch('/bookings/:id', validate(z.object({ status: z.enum(['pending', 'confirm
     }
     // Also when the admin fills in the amount AFTER completing the booking: the commission is safe to attempt again (unique key per activity).
     if (b.status === 'completed' && (changed || amount !== undefined)) await maybeCommission(b, req.user._id);
+    // Also when the admin fills in the amount AFTER completing the booking: the commission is safe to attempt again (unique key per activity).
+    if (b.status === 'completed' && (changed || amount !== undefined)) await maybeCommission(b, req.user._id);
     await audit(req.user._id, 'booking.update', b.bookingId, remarks, { status, amount }, req.ip);
     res.json(b);
   }));
@@ -87,11 +89,13 @@ r.get('/users/:id', asyncH(async (req, res) => {
 }));
 const userEdit = z.object({
   name: z.string().min(2).max(80).optional(), username: z.string().min(3).max(24).regex(/^[a-z0-9_]+$/i).optional(), email: z.string().email().optional().or(z.literal('')),
+  name: z.string().min(2).max(80).optional(), username: z.string().min(3).max(24).regex(/^[a-z0-9_]+$/i).optional(), email: z.string().email().optional().or(z.literal('')),
   mobile: z.string().regex(/^[6-9]\d{9}$/, 'Enter a valid 10-digit mobile').optional(), address: z.string().max(300).optional(), city: z.string().max(80).optional(), state: z.string().max(80).optional(),
   pin: z.string().regex(/^\d{6}$/).optional().or(z.literal('')), status: z.enum(['active', 'suspended']).optional(), newPassword: z.string().min(8).regex(/^(?=.*[A-Za-z])(?=.*\d)/, 'Password needs a letter and a number').optional() });
 r.patch('/users/:id', validate(userEdit), asyncH(async (req, res) => {
   const u = await M.User.findOne({ _id: req.params.id, role: 'user' }); if (!u) throw new HttpError(404, 'User not found');
   const { newPassword, ...b } = req.body; const changed = {};
+  if (b.username) b.username = b.username.toLowerCase(); if (b.email === '') delete b.email; if (b.email) b.email = b.email.toLowerCase(); // email is optional: blank = leave as is
   if (b.username) b.username = b.username.toLowerCase(); if (b.email === '') delete b.email; if (b.email) b.email = b.email.toLowerCase(); // email is optional: blank = leave as is
   for (const k of ['username', 'email', 'mobile']) if (b[k] && b[k] !== u[k] && (await M.User.exists({ [k]: b[k], _id: { $ne: u._id } }))) throw new HttpError(409, `This ${k} is already used by another account`);
   for (const k of Object.keys(b)) if (b[k] !== undefined && b[k] !== u[k]) { changed[k] = [u[k], b[k]]; u[k] = b[k]; }
@@ -213,6 +217,29 @@ r.patch('/transfers/:id', validate(z.object({ status: z.enum(['completed', 'reje
   });
   await audit(req.user._id, 'transfer.' + out.status, out.reference, req.body.remarks, { amount: out.amount }, req.ip); res.json(out);
 }));
+r.get('/transfers', asyncH(async (req, res) => res.json(await list(M.Transfer, req, { populate: [{ path: 'from', select: 'name userId' }, { path: 'to', select: 'name userId' }], search: ['reference', 'fromWalletId', 'toWalletId'] }))));
+// Approve = credit the recipient's earned income. Reject = refund the sender. Either happens once (status must be pending).
+r.patch('/transfers/:id', validate(z.object({ status: z.enum(['completed', 'rejected']), remarks: z.string().max(300).optional() })), asyncH(async (req, res) => {
+  const out = await withTx(async (s) => {
+    const cur = await M.Transfer.findById(req.params.id).session(s); if (!cur || cur.status !== 'pending') throw new HttpError(409, 'Already processed');
+    const to = await M.User.findById(cur.to).session(s);
+    // check before changing anything, so a refused approval leaves the transfer pending
+    if (req.body.status === 'completed' && (!to || to.status !== 'active')) throw new HttpError(409, 'The recipient account is not active. Reject this transfer to refund the sender.');
+    const t = await M.Transfer.findOneAndUpdate({ _id: req.params.id, status: 'pending' }, { status: req.body.status, remarks: req.body.remarks, reviewedBy: req.user._id }, { new: true, session: s });
+    if (!t) throw new HttpError(409, 'Already processed');
+    if (t.status === 'completed') {
+      await credit(s, { userId: t.to, amount: t.amount, bucket: 'earned', type: 'transfer_in', note: `From ${(await M.User.findById(t.from).session(s))?.userId} (earned income)`, relatedId: t.reference });
+      await M.Wallet.updateOne({ user: t.from }, { $inc: { totalTransfers: t.amount } }, { session: s });
+      await notify(s, t.to, 'Funds received', `${inr(t.amount)} earned income`, '/wallet');
+      await notify(s, t.from, 'Transfer approved', `${inr(t.amount)} sent to ${to.userId}`, '/wallet');
+    } else {
+      await credit(s, { userId: t.from, amount: t.amount, bucket: 'earned', type: 'transfer_refund', note: 'Transfer rejected, refunded', relatedId: t.reference });
+      await notify(s, t.from, 'Transfer rejected', t.remarks || `${inr(t.amount)} refunded to your earned income`, '/wallet');
+    }
+    return t;
+  });
+  await audit(req.user._id, 'transfer.' + out.status, out.reference, req.body.remarks, { amount: out.amount }, req.ip); res.json(out);
+}));
 r.get('/transactions', asyncH(async (req, res) => res.json(await list(M.WalletTransaction, req, { populate: { path: 'user', select: 'name userId walletId' }, search: ['reference', 'note'], keys: ['type'] }))));
 r.get('/wallets', asyncH(async (req, res) => {
   const f = {};
@@ -294,39 +321,24 @@ r.get('/monthly-returns', asyncH(async (req, res) => res.json(await list(M.Month
 r.post('/returns/run-month-end', asyncH(async (req, res) => { const out = await runMonthEnd({ force: true }); await audit(req.user._id, 'returns.month_end', out.month || '', null, out, req.ip); res.json(out); }));
 r.post('/returns/run', asyncH(async (req, res) => { const out = await runDailyReturns(); await audit(req.user._id, 'returns.run', out.date || '', null, out, req.ip); res.json(out); }));
 
-// ---------------- banners (landing page) ----------------
-const bannerBody = z.object({ title: z.string().max(80).optional(), subtitle: z.string().max(160).optional(), link: z.string().max(300).optional() });
-const imgOnly = (f) => { if (f && !f.mimetype.startsWith('image/')) throw new HttpError(400, 'The banner must be an image (PNG, JPG or WEBP)'); };
-r.get('/banners', asyncH(async (req, res) => res.json(await M.Banner.find().sort({ order: 1, createdAt: -1 }))));
-r.post('/banners', upload.single('image'), asyncH(async (req, res) => {
-  if (!req.file) throw new HttpError(400, 'Choose a banner image'); imgOnly(req.file); const b = bannerBody.parse(req.body); const count = await M.Banner.countDocuments();
-  const doc = await M.Banner.create({ ...b, image: '/uploads/' + req.file.filename, order: count, active: req.body.active === undefined ? true : strBool(req.body.active) });
-  await audit(req.user._id, 'banner.create', String(doc._id), null, null, req.ip); res.status(201).json(doc);
-}));
-r.put('/banners/:id', upload.single('image'), asyncH(async (req, res) => {
-  imgOnly(req.file); const b = bannerBody.parse(req.body); const set = { ...b, active: strBool(req.body.active), order: Number(req.body.order) || 0 }; if (req.file) set.image = '/uploads/' + req.file.filename;
-  const doc = await M.Banner.findByIdAndUpdate(req.params.id, set, { new: true }); if (!doc) throw new HttpError(404, 'Banner not found'); res.json(doc);
-}));
-r.patch('/banners/:id/toggle', asyncH(async (req, res) => { const b = await M.Banner.findById(req.params.id); if (!b) throw new HttpError(404, 'Banner not found'); b.active = !b.active; await b.save(); res.json(b); }));
-r.delete('/banners/:id', asyncH(async (req, res) => { await M.Banner.findByIdAndDelete(req.params.id); await audit(req.user._id, 'banner.delete', req.params.id, null, null, req.ip); res.json({ ok: true }); }));
-
 // ---------------- settings / notifications ----------------
 const pct = (max) => z.coerce.number().min(0).max(max);
 const feeRow = z.object({ enabled: z.boolean(), label: z.string().min(1).max(40), percent: pct(50) });
 r.get('/settings', asyncH(async (req, res) => { const s = await getSettings(); res.json({ ...s, preview: { dailyPercent: dailyPercent(s.returns) } }); }));
 r.put('/settings', validate(z.object({
-  returns: z.object({ enabled: z.boolean(), inputMode: z.enum(['daily', 'monthly']).default('daily'), dailyPercent: pct(10).default(0), monthlyPercent: pct(60), daysBasis: z.enum(['calendar', 'fixed30']), base: z.enum(['principal', 'balance', 'earned']), minBalance: z.coerce.number().int().min(0), frequency: z.literal('daily').default('daily'), startDate: z.string().nullable().optional(), conditions: z.string().max(1500) }),
+  returns: z.object({ enabled: z.boolean(), inputMode: z.enum(['daily', 'monthly']).default('daily'), dailyPercent: pct(10).default(0), monthlyPercent: pct(60), daysBasis: z.enum(['calendar', 'fixed30']), base: z.enum(['principal', 'balance']), minBalance: z.coerce.number().int().min(0), frequency: z.literal('daily').default('daily'), startDate: z.string().nullable().optional(), conditions: z.string().max(1500) }),
   principalReturn: z.object({ enabled: z.boolean(), percent: pct(100), minPrincipal: z.coerce.number().int().min(0), conditions: z.string().max(1500) }),
   referral: z.object({ enabled: z.boolean(), bookingEnabled: z.boolean().default(true), percent: pct(50), basis: z.literal('booking_amount').default('booking_amount'), eligibleActivity: z.enum(['first_completed_booking', 'every_completed_booking']), autoApprove: z.boolean(),
-    deposit: z.object({ enabled: z.boolean(), mode: z.enum(['percent', 'fixed']).default('percent'), percent: pct(50), fixedAmount: z.coerce.number().int().min(0).default(0), eligible: z.enum(['first_deposit', 'every_deposit']), minAmount: z.coerce.number().int().min(0) }),
-    earning: z.object({ enabled: z.boolean(), percent: pct(50), payout: z.enum(['daily', 'month_end']).default('month_end'), display: z.enum(['daily', 'overall']).default('daily') }) }),
+    deposit: z.object({ enabled: z.boolean(), percent: pct(50), eligible: z.enum(['first_deposit', 'every_deposit']), minAmount: z.coerce.number().int().min(0) }),
+    holding: z.object({ enabled: z.boolean(), percent: pct(50), payout: z.enum(['daily', 'month_end']).default('month_end') }),
+    earning: z.object({ enabled: z.boolean(), percent: pct(50), payout: z.enum(['daily', 'month_end']).default('month_end') }) }),
   wallet: z.object({ minWithdrawal: z.coerce.number().int().min(100), minDeposit: z.coerce.number().int().min(100), methods: z.array(z.string()).min(1), depositInstructions: z.string().max(600),
     tds: feeRow, service: feeRow, principalLock: z.object({ enabled: z.boolean(), mode: z.enum(['days', 'date']), days: z.coerce.number().int().min(0).max(3650), date: z.string().nullable().optional() }) }),
   contact: z.object({ whatsapp: z.string().regex(/^\d{8,15}$/, 'WhatsApp number: digits only with country code, e.g. 919876543210'), message: z.string().max(200), phone: z.string().max(40), email: z.string().max(120), address: z.string().max(200) }),
   legalReviewConfirmed: z.boolean().optional() })), asyncH(async (req, res) => {
   const { legalReviewConfirmed, ...data } = req.body; const cur = await getSettings();
   const on = (n, o) => n?.enabled && !o?.enabled;
-  const enabling = on(data.returns, cur.returns) || on(data.principalReturn, cur.principalReturn) || on(data.referral, cur.referral) || on(data.referral.deposit, cur.referral.deposit) || on(data.referral.earning, cur.referral.earning);
+  const enabling = on(data.returns, cur.returns) || on(data.principalReturn, cur.principalReturn) || on(data.referral, cur.referral) || on(data.referral.deposit, cur.referral.deposit) || on(data.referral.holding, cur.referral.holding) || on(data.referral.earning, cur.referral.earning);
   if (enabling && !legalReviewConfirmed) throw new HttpError(400, 'Tick the confirmation that legal/regulatory review is complete before switching on earnings or referral payouts');
   if (data.wallet.principalLock.enabled && data.wallet.principalLock.mode === 'date' && !data.wallet.principalLock.date) throw new HttpError(400, 'Choose the date until which principal stays locked');
   await M.ApplicationSetting.findOneAndUpdate({ key: 'app' }, { key: 'app', data }, { upsert: true });

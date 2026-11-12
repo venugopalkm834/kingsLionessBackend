@@ -44,6 +44,7 @@ function lockInfo(L, wallet, now = new Date()) {
   if (!(wallet?.principal > 0)) return { locked: false, unlockAt: null }; // nothing to lock
   const extra = wallet.lockUntil ? new Date(wallet.lockUntil) : null;
   let unlockAt;
+
   if (wallet.lockManual) unlockAt = extra;
   else {
     let base = null;
@@ -53,6 +54,13 @@ function lockInfo(L, wallet, now = new Date()) {
     if (!unlockAt) return { locked: true, unlockAt: null };
   }
   return { locked: !!unlockAt && now < unlockAt, unlockAt };
+}
+// Admin's lock choice -> a date. {mode:'default'} = use the Settings rule. Months are calendar months.
+function lockDate({ mode, days, months, date } = {}, from = new Date()) {
+  if (mode === 'days') { const n = Number(days); if (!(n >= 0 && n <= 3650)) throw new HttpError(400, 'Lock days must be between 0 and 3650'); return new Date(+from + n * 864e5); }
+  if (mode === 'months') { const n = Number(months); if (!(n >= 1 && n <= 120)) throw new HttpError(400, 'Lock months must be between 1 and 120'); const d = new Date(from); d.setMonth(d.getMonth() + n); return d; }
+  if (mode === 'date') { const d = new Date(String(date) + 'T00:00:00.000Z'); if (!date || isNaN(d)) throw new HttpError(400, 'Choose a valid unlock date'); return d; }
+  return null;
 }
 // Admin's lock choice -> a date. {mode:'default'} = use the Settings rule. Months are calendar months.
 function lockDate({ mode, days, months, date } = {}, from = new Date()) {
@@ -73,6 +81,7 @@ async function credit(session, { userId, amount, type, note, relatedId, bucket =
   const e = split ? split.earned : bucket === 'earned' ? amount : 0;
   if (p + e !== amount || amount < 1) throw new HttpError(400, 'Invalid amount');
   const update = { $inc: { balance: amount, principal: p, earned: e, ...totals } };
+  if (touchDeposit) update.$set = { lastDepositAt: new Date(), lockManual: false };
   if (touchDeposit) update.$set = { lastDepositAt: new Date(), lockManual: false };
   if (lockUntil) update.$max = { lockUntil: new Date(lockUntil) };
   const w = await Wallet.findOneAndUpdate({ user: userId }, update, { new: true, session });
@@ -100,4 +109,5 @@ async function debit(session, { userId, amount, type, note, relatedId, policy = 
 const notify = (session, userId, title, body, link) => Notification.create([{ user: userId, title, body, link }], { session });
 const notifyAdmin = (title, body, link) => Notification.create({ forAdmin: true, title, body, link });
 const audit = (actor, action, target, reason, meta, ip) => AuditLog.create({ actor, action, target, reason, meta, ip });
+module.exports = { getSettings, credit, debit, notify, notifyAdmin, audit, DEFAULTS, dailyPercent, baseField, daysIn, lockInfo, lockDate, calcFees, todayStr, monthStr, isLastDayOfMonth };
 module.exports = { getSettings, credit, debit, notify, notifyAdmin, audit, DEFAULTS, dailyPercent, baseField, daysIn, lockInfo, lockDate, calcFees, todayStr, monthStr, isLastDayOfMonth };
