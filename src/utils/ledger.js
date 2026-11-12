@@ -3,11 +3,15 @@ const { ids, HttpError } = require('./helpers');
 
 const DEFAULTS = {
   returns: { enabled: false, inputMode: 'daily', dailyPercent: 0.3, monthlyPercent: 9, daysBasis: 'calendar', base: 'earned', minBalance: 100000, frequency: 'daily', startDate: null,
+  returns: { enabled: false, inputMode: 'daily', dailyPercent: 0.3, monthlyPercent: 9, daysBasis: 'calendar', base: 'earned', minBalance: 100000, frequency: 'daily', startDate: null,
     conditions: 'Returns are a calculated program benefit under the published terms. They are not guaranteed and may be changed or withdrawn.' },
   // Separate program: a monthly % of the principal held, credited to earned income at month end.
   principalReturn: { enabled: false, percent: 2, minPrincipal: 100000,
     conditions: 'Month-end principal return is a program benefit under the published terms. It is not guaranteed and may be changed or withdrawn.' },
   referral: { enabled: false, percent: 10, basis: 'booking_amount', eligibleActivity: 'first_completed_booking', autoApprove: false, bookingEnabled: true,
+    deposit: { enabled: false, mode: 'percent', percent: 5, fixedAmount: 0, eligible: 'first_deposit', minAmount: 0 },
+    // commission on what each referred user earns; `display` = how the user wallet shows referral commission (daily-wise or overall)
+    earning: { enabled: false, percent: 5, payout: 'month_end', display: 'daily' } },
     deposit: { enabled: false, mode: 'percent', percent: 5, fixedAmount: 0, eligible: 'first_deposit', minAmount: 0 },
     // commission on what each referred user earns; `display` = how the user wallet shows referral commission (daily-wise or overall)
     earning: { enabled: false, percent: 5, payout: 'month_end', display: 'daily' } },
@@ -26,6 +30,8 @@ async function getSettings() { const d = await ApplicationSetting.findOne({ key:
 const daysIn = (d) => new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 0)).getUTCDate();
 // inputMode 'daily': admin types the daily % directly. 'monthly': monthly % is divided into days.
 const dailyPercent = (r, d = new Date()) => (r.inputMode === 'monthly' ? (Number(r.monthlyPercent) || 0) / (r.daysBasis === 'fixed30' ? 30 : daysIn(d)) : Number(r.dailyPercent) || 0);
+// Which wallet field the daily earning is calculated on: principal, balance (total) or earned (earning wallet).
+const baseField = (r) => (r?.base === 'balance' || r?.base === 'earned' ? r.base : 'principal');
 // Which wallet field the daily earning is calculated on: principal, balance (total) or earned (earning wallet).
 const baseField = (r) => (r?.base === 'balance' || r?.base === 'earned' ? r.base : 'principal');
 const pad = (n) => String(n).padStart(2, '0');
