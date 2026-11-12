@@ -2,15 +2,15 @@ const { Wallet, WalletTransaction, ApplicationSetting, Notification, AuditLog } 
 const { ids, HttpError } = require('./helpers');
 
 const DEFAULTS = {
-  returns: { enabled: false, inputMode: 'daily', dailyPercent: 0.3, monthlyPercent: 9, daysBasis: 'calendar', base: 'principal', minBalance: 100000, frequency: 'daily', startDate: null,
+  returns: { enabled: false, inputMode: 'daily', dailyPercent: 0.3, monthlyPercent: 9, daysBasis: 'calendar', base: 'earned', minBalance: 100000, frequency: 'daily', startDate: null,
     conditions: 'Returns are a calculated program benefit under the published terms. They are not guaranteed and may be changed or withdrawn.' },
   // Separate program: a monthly % of the principal held, credited to earned income at month end.
   principalReturn: { enabled: false, percent: 2, minPrincipal: 100000,
     conditions: 'Month-end principal return is a program benefit under the published terms. It is not guaranteed and may be changed or withdrawn.' },
   referral: { enabled: false, percent: 10, basis: 'booking_amount', eligibleActivity: 'first_completed_booking', autoApprove: false, bookingEnabled: true,
-    deposit: { enabled: false, percent: 5, eligible: 'first_deposit', minAmount: 0 },
-    holding: { enabled: false, percent: 1, payout: 'month_end' },
-    earning: { enabled: false, percent: 5, payout: 'month_end' } },
+    deposit: { enabled: false, mode: 'percent', percent: 5, fixedAmount: 0, eligible: 'first_deposit', minAmount: 0 },
+    // commission on what each referred user earns; `display` = how the user wallet shows referral commission (daily-wise or overall)
+    earning: { enabled: false, percent: 5, payout: 'month_end', display: 'daily' } },
   wallet: {
     minWithdrawal: 50000, minDeposit: 10000, methods: ['UPI', 'Bank Transfer', 'NEFT/IMPS'], depositInstructions: 'Pay to the account shown by support, then upload the payment proof.',
     tds: { enabled: true, label: 'TDS', percent: 2 }, service: { enabled: true, label: 'Service charges', percent: 2 },
@@ -26,22 +26,39 @@ async function getSettings() { const d = await ApplicationSetting.findOne({ key:
 const daysIn = (d) => new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 0)).getUTCDate();
 // inputMode 'daily': admin types the daily % directly. 'monthly': monthly % is divided into days.
 const dailyPercent = (r, d = new Date()) => (r.inputMode === 'monthly' ? (Number(r.monthlyPercent) || 0) / (r.daysBasis === 'fixed30' ? 30 : daysIn(d)) : Number(r.dailyPercent) || 0);
+// Which wallet field the daily earning is calculated on: principal, balance (total) or earned (earning wallet).
+const baseField = (r) => (r?.base === 'balance' || r?.base === 'earned' ? r.base : 'principal');
 const pad = (n) => String(n).padStart(2, '0');
 const todayStr = (d = new Date()) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`; // server-local date
 const monthStr = (d = new Date()) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}`;
 const isLastDayOfMonth = (d = new Date()) => new Date(d.getFullYear(), d.getMonth(), d.getDate() + 1).getDate() === 1;
 
-// Principal can't be withdrawn while locked. Lock = last deposit + N days, or a fixed date, as set by the admin.
+// Principal can't be withdrawn while locked.
+// Unlock date = the LATER of: (a) the admin's default rule (latest deposit + N days, or a fixed date) and (b) wallet.lockUntil
+// (set by the admin when approving a deposit, or on the Wallet Management page).
+// wallet.lockManual = the admin set an exact date for this user: only wallet.lockUntil counts (a past date means unlocked).
+// If the lock is on but no date can be worked out, principal stays LOCKED until the admin sets one (never silently unlocked).
 function lockInfo(L, wallet, now = new Date()) {
   if (!L?.enabled) return { locked: false, unlockAt: null };
-  let base = null;
-  if (L.mode === 'date') { if (L.date) base = new Date(L.date + 'T00:00:00.000Z'); }
-  else if (Number(L.days) > 0 && wallet?.lastDepositAt) base = new Date(+new Date(wallet.lastDepositAt) + L.days * 864e5);
-  // lockUntil is set when locked principal is received by transfer: it keeps the sender's remaining lock period.
-  const extra = wallet?.lockUntil ? new Date(wallet.lockUntil) : null;
-  if (L.mode === 'date' && !L.date && !extra) return { locked: true, unlockAt: null }; // lock on, date not set yet: stay locked
-  const unlockAt = [base, extra].filter(Boolean).sort((a, b) => b - a)[0] || null;
+  if (!(wallet?.principal > 0)) return { locked: false, unlockAt: null }; // nothing to lock
+  const extra = wallet.lockUntil ? new Date(wallet.lockUntil) : null;
+  let unlockAt;
+  if (wallet.lockManual) unlockAt = extra;
+  else {
+    let base = null;
+    if (L.mode === 'date') { if (L.date) base = new Date(L.date + 'T00:00:00.000Z'); }
+    else { const since = wallet.lastDepositAt || wallet.createdAt; if (since) base = new Date(+new Date(since) + (Number(L.days) || 0) * 864e5); }
+    unlockAt = [base, extra].filter(Boolean).sort((a, b) => b - a)[0] || null;
+    if (!unlockAt) return { locked: true, unlockAt: null };
+  }
   return { locked: !!unlockAt && now < unlockAt, unlockAt };
+}
+// Admin's lock choice -> a date. {mode:'default'} = use the Settings rule. Months are calendar months.
+function lockDate({ mode, days, months, date } = {}, from = new Date()) {
+  if (mode === 'days') { const n = Number(days); if (!(n >= 0 && n <= 3650)) throw new HttpError(400, 'Lock days must be between 0 and 3650'); return new Date(+from + n * 864e5); }
+  if (mode === 'months') { const n = Number(months); if (!(n >= 1 && n <= 120)) throw new HttpError(400, 'Lock months must be between 1 and 120'); const d = new Date(from); d.setMonth(d.getMonth() + n); return d; }
+  if (mode === 'date') { const d = new Date(String(date) + 'T00:00:00.000Z'); if (!date || isNaN(d)) throw new HttpError(400, 'Choose a valid unlock date'); return d; }
+  return null;
 }
 function calcFees(w, amount) {
   const tds = w.tds?.enabled ? Math.round((amount * w.tds.percent) / 100) : 0;
@@ -55,7 +72,7 @@ async function credit(session, { userId, amount, type, note, relatedId, bucket =
   const e = split ? split.earned : bucket === 'earned' ? amount : 0;
   if (p + e !== amount || amount < 1) throw new HttpError(400, 'Invalid amount');
   const update = { $inc: { balance: amount, principal: p, earned: e, ...totals } };
-  if (touchDeposit) update.$set = { lastDepositAt: new Date() };
+  if (touchDeposit) update.$set = { lastDepositAt: new Date(), lockManual: false };
   if (lockUntil) update.$max = { lockUntil: new Date(lockUntil) };
   const w = await Wallet.findOneAndUpdate({ user: userId }, update, { new: true, session });
   if (!w) throw new HttpError(404, 'Wallet not found');
@@ -82,4 +99,4 @@ async function debit(session, { userId, amount, type, note, relatedId, policy = 
 const notify = (session, userId, title, body, link) => Notification.create([{ user: userId, title, body, link }], { session });
 const notifyAdmin = (title, body, link) => Notification.create({ forAdmin: true, title, body, link });
 const audit = (actor, action, target, reason, meta, ip) => AuditLog.create({ actor, action, target, reason, meta, ip });
-module.exports = { getSettings, credit, debit, notify, notifyAdmin, audit, DEFAULTS, dailyPercent, lockInfo, calcFees, todayStr, monthStr, isLastDayOfMonth };
+module.exports = { getSettings, credit, debit, notify, notifyAdmin, audit, DEFAULTS, dailyPercent, baseField, daysIn, lockInfo, lockDate, calcFees, todayStr, monthStr, isLastDayOfMonth };

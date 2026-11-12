@@ -8,20 +8,23 @@ const { sign, auth, validate } = require('../middleware');
 const { notifyAdmin } = require('../utils/ledger');
 
 const pw = z.string().min(8).regex(/[A-Za-z]/, 'needs a letter').regex(/\d/, 'needs a number');
+// Users sign up with name, username, mobile and password (no email) and sign in with mobile OR username.
+const mobile = z.string().regex(/^[6-9]\d{9}$/, 'Enter a valid 10-digit mobile');
 const reg = z.object({
-  name: z.string().min(2).max(80), username: z.string().min(3).max(24).regex(/^[a-z0-9_]+$/i),
-  email: z.string().email(), mobile: z.string().regex(/^[6-9]\d{9}$/, 'Enter a valid 10-digit mobile'),
-  password: pw, referralCode: z.string().optional(),
+  name: z.string().min(2).max(80), username: z.string().min(3).max(24).regex(/^[a-z0-9_]+$/i, 'Letters, numbers and _ only'), mobile, password: pw, referralCode: z.string().optional(),
 });
 const publicUser = (u, w) => ({ id: u._id, userId: u.userId, name: u.name, username: u.username, email: u.email, mobile: u.mobile,
-  role: u.role, referralCode: u.referralCode, avatar: u.avatar, address: u.address, city: u.city, state: u.state, pin: u.pin, status: u.status, createdAt: u.createdAt, ...(w ? { balance: w.balance } : {}) });
+  role: u.role, referralCode: u.referralCode, nominee: u.nominee, avatar: u.avatar, address: u.address, city: u.city, state: u.state, pin: u.pin, status: u.status, createdAt: u.createdAt, ...(w ? { balance: w.balance } : {}) });
 
 r.post('/register', validate(reg), asyncH(async (req, res) => {
   const b = req.body;
   if (await User.exists({ mobile: b.mobile })) throw new HttpError(409, 'This mobile number is already registered');
-  const referrer = b.referralCode ? await User.findOne({ referralCode: b.referralCode.toUpperCase() }) : null;
+  const username = b.username.toLowerCase();
+  if (await User.exists({ username })) throw new HttpError(409, 'This username is already taken');
+  const referrer = b.referralCode ? await User.findOne({ referralCode: b.referralCode.trim().toUpperCase() }) : null;
+  if (b.referralCode && b.referralCode.trim() && !referrer) throw new HttpError(400, 'Invalid referral code. Check it or leave it blank.');
   const user = await withTx(async (s) => {
-    const [u] = await User.create([{ ...b, username: b.username.toLowerCase(), passwordHash: await bcrypt.hash(b.password, 12),
+    const [u] = await User.create([{ name: b.name, mobile: b.mobile, username, passwordHash: await bcrypt.hash(b.password, 12),
       userId: await newUserId(User, s), walletId: ids.wallet(), referralCode: ids.refCode(), referredBy: referrer?._id }], { session: s });
     await Wallet.create([{ user: u._id, walletId: u.walletId }], { session: s });
     // self-referral is impossible: the new user's code did not exist before registration
@@ -32,18 +35,25 @@ r.post('/register', validate(reg), asyncH(async (req, res) => {
   res.status(201).json({ token: sign(user), user: publicUser(user) });
 }));
 
-const login = (adminOnly) => asyncH(async (req, res) => {
-  const { identifier, password } = req.body;
-  const q = identifier.toLowerCase();
-  const u = await User.findOne({ $or: [{ email: q }, { username: q }] }).select('+passwordHash');
-  if (!u || !(await bcrypt.compare(password, u.passwordHash))) throw new HttpError(401, 'Invalid credentials');
-  if (adminOnly !== (u.role === 'admin')) throw new HttpError(403, adminOnly ? 'Not an admin account' : 'Please use the admin login');
+// Customer login: mobile number OR username, plus password. Admin login keeps email / username.
+r.post('/login', validate(z.object({ identifier: z.string().min(3).max(60), password: z.string().min(1) })), asyncH(async (req, res) => {
+  const id = req.body.identifier.trim().toLowerCase();
+  const q = /^[6-9]\d{9}$/.test(id) ? { mobile: id } : { username: id };
+  // Older databases may hold more than one account on a number: the password decides which one it is.
+  const candidates = await User.find({ ...q, role: 'user' }).select('+passwordHash');
+  let u = null;
+  for (const c of candidates) if (await bcrypt.compare(req.body.password, c.passwordHash)) { u = c; break; }
+  if (!u) throw new HttpError(401, 'Invalid mobile / username or password');
   if (u.status !== 'active') throw new HttpError(403, 'Account suspended');
   res.json({ token: sign(u), user: publicUser(u) });
-});
-const lg = validate(z.object({ identifier: z.string().min(2), password: z.string().min(1) }));
-r.post('/login', lg, login(false));
-r.post('/admin/login', lg, login(true));
+}));
+r.post('/admin/login', validate(z.object({ identifier: z.string().min(2), password: z.string().min(1) })), asyncH(async (req, res) => {
+  const q = req.body.identifier.toLowerCase();
+  const u = await User.findOne({ role: 'admin', $or: [{ email: q }, { username: q }] }).select('+passwordHash');
+  if (!u || !(await bcrypt.compare(req.body.password, u.passwordHash))) throw new HttpError(401, 'Invalid credentials');
+  if (u.status !== 'active') throw new HttpError(403, 'Account suspended');
+  res.json({ token: sign(u), user: publicUser(u) });
+}));
 
 r.get('/me', auth, asyncH(async (req, res) => { const w = await Wallet.findOne({ user: req.user._id }); res.json(publicUser(req.user, w)); }));
 r.put('/me', auth, validate(z.object({ name: z.string().min(2).max(80), mobile: z.string().regex(/^[6-9]\d{9}$/), address: z.string().max(300).optional(),
