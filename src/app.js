@@ -18,9 +18,11 @@ app.use(helmet({
 }));
 
 // CORS configuration
+// Extra origins can be added without a code change: CLIENT_URL="https://a.com,https://b.com"
 const allowedOrigins = [
     'http://localhost:4200',
-    'https://kingslionessfrontend.onrender.com'
+    'https://kingslionessfrontend.onrender.com',
+    ...(process.env.CLIENT_URL || '').split(',').map((u) => u.trim().replace(/\/$/, '')).filter(Boolean)
 ];
 
 app.use(cors({
@@ -34,9 +36,10 @@ app.use(express.json({ limit: '1mb' }));
 if (process.env.NODE_ENV !== 'test') {
     app.use(morgan('dev'));
 }
-require('fs').mkdirSync(path.join(__dirname, '../uploads'), { recursive: true });
+const uploadDir = process.env.UPLOAD_DIR || path.join(__dirname, '../uploads');
+require('fs').mkdirSync(uploadDir, { recursive: true });
 app.use('/uploads', express.static(
-    path.join(__dirname, '../uploads'),
+    uploadDir,
     {
         setHeaders: (r) => r.set('X-Content-Type-Options', 'nosniff')
     }

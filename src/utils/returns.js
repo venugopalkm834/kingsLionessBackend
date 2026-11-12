@@ -1,6 +1,6 @@
 const { Wallet, DailyReturn, MonthlyReturn, Referral } = require('../models');
 const { withTx, inr } = require('./helpers');
-const { getSettings, credit, notify, dailyPercent, todayStr, monthStr, isLastDayOfMonth } = require('./ledger');
+const { getSettings, credit, notify, dailyPercent, baseField, todayStr, monthStr, isLastDayOfMonth } = require('./ledger');
 const { addCommission } = require('./referral');
 
 // DAILY earning: the admin sets a daily % (or a monthly % that is split into days). Credited every day to EARNED income.
@@ -11,7 +11,7 @@ async function creditDaily() {
   if (s.startDate && date < s.startDate) return { skipped: 'Program has not started yet', date };
   const pct = dailyPercent(s);
   if (!(pct > 0)) return { skipped: 'Daily percentage is 0', date };
-  const base = s.base === 'balance' ? 'balance' : 'principal';
+  const base = baseField(s); // 'principal' | 'balance' | 'earned'
   let credited = 0; let duplicates = 0; let total = 0;
   for await (const w of Wallet.find({ [base]: { $gte: Math.max(1, s.minBalance) } }).cursor()) {
     const basis = w[base]; const amount = Math.floor((basis * pct) / 100); if (amount < 1) continue;
@@ -29,11 +29,11 @@ async function creditDaily() {
 
 // MONTH-END principal return (separate setting): percent of the principal held, credited once per month to EARNED income.
 // Runs automatically on the last day of the month; admin can also run it manually (force) for the current month.
-// Also pays the referral "holding" commission on the same schedule (percent of each referred user's principal).
+// Also pays the month-end referral "earning" commission (percent of what each referred user earned this month).
 async function runMonthEnd({ force = false } = {}) {
   const st = await getSettings(); const s = st.principalReturn; const now = new Date(); const month = monthStr(now);
   if (!force && !isLastDayOfMonth(now)) return { skipped: 'Not the last day of the month', month };
-  const out = { month, credited: 0, duplicates: 0, total: 0, holdingCommissions: 0 };
+  const out = { month, credited: 0, duplicates: 0, total: 0 };
   if (s.enabled && Number(s.percent) > 0) {
     for await (const w of Wallet.find({ principal: { $gte: Math.max(1, s.minPrincipal) } }).cursor()) {
       const amount = Math.floor((w.principal * Number(s.percent)) / 100); if (amount < 1) continue;
@@ -48,14 +48,9 @@ async function runMonthEnd({ force = false } = {}) {
     }
   } else out.principalReturn = 'disabled';
   const R = st.referral; out.referralCommissions = 0;
-  const wantH = R.enabled && R.holding?.enabled && R.holding.payout !== 'daily' && Number(R.holding.percent) > 0;
   const wantE = R.enabled && R.earning?.enabled && R.earning.payout !== 'daily' && Number(R.earning.percent) > 0;
-  if (wantH || wantE) {
+  if (wantE) {
     for await (const ref of Referral.find().cursor()) {
-      if (wantH) {
-        const w = await Wallet.findOne({ user: ref.referred });
-        if (w && w.principal > 0) { const c = await addCommission({ referrer: ref.referrer, referred: ref.referred, kind: 'holding', key: `hold:${month}:${ref.referred}`, basis: w.principal, percent: Number(R.holding.percent), autoApprove: R.autoApprove }); if (c) out.referralCommissions++; }
-      }
       if (wantE) {
         // everything the referred user earned this month: daily earnings + month-end principal return
         const [d, m] = await Promise.all([DailyReturn.aggregate([{ $match: { user: ref.referred, date: { $regex: '^' + month } } }, { $group: { _id: null, v: { $sum: '$amount' } } }]),
@@ -65,26 +60,20 @@ async function runMonthEnd({ force = false } = {}) {
       }
     }
   }
-  out.holdingCommissions = out.referralCommissions;
   return out;
 }
 
 // Referral commissions that are paid DAILY (admin chooses daily or month-end per type):
-//  - earning: % of the referred user's earning credited that day; - holding: % of the referred user's principal that day.
+//  - earning: % of the referred user's earning credited that day (when the admin chose daily payout).
 async function runDailyReferral(date) {
   const R = (await getSettings()).referral; let made = 0;
   if (!R.enabled) return 0;
   const wantE = R.earning?.enabled && R.earning.payout === 'daily' && Number(R.earning.percent) > 0;
-  const wantH = R.holding?.enabled && R.holding.payout === 'daily' && Number(R.holding.percent) > 0;
-  if (!wantE && !wantH) return 0;
+  if (!wantE) return 0;
   for await (const ref of Referral.find().cursor()) {
     if (wantE) {
       const dr = await DailyReturn.findOne({ user: ref.referred, date });
       if (dr?.amount) { const c = await addCommission({ referrer: ref.referrer, referred: ref.referred, kind: 'earning', key: `earn:${date}:${ref.referred}`, basis: dr.amount, percent: Number(R.earning.percent), autoApprove: R.autoApprove }); if (c) made++; }
-    }
-    if (wantH) {
-      const w = await Wallet.findOne({ user: ref.referred });
-      if (w?.principal > 0) { const c = await addCommission({ referrer: ref.referrer, referred: ref.referred, kind: 'holding', key: `holdd:${date}:${ref.referred}`, basis: w.principal, percent: Number(R.holding.percent), autoApprove: R.autoApprove }); if (c) made++; }
     }
   }
   return made;

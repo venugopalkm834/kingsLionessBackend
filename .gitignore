@@ -1,6 +1,5 @@
 node_modules
-dist
 .env
-server/uploads/*
-!server/uploads/.gitkeep
-.angular
+# user uploads (receipts, voice notes, QR codes) must never go to git
+uploads/*
+!uploads/.gitkeep

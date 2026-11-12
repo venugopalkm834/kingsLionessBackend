@@ -2,15 +2,15 @@ const { Wallet, WalletTransaction, ApplicationSetting, Notification, AuditLog } 
 const { ids, HttpError } = require('./helpers');
 
 const DEFAULTS = {
-  returns: { enabled: false, inputMode: 'daily', dailyPercent: 0.3, monthlyPercent: 9, daysBasis: 'calendar', base: 'principal', minBalance: 100000, frequency: 'daily', startDate: null,
+  returns: { enabled: false, inputMode: 'daily', dailyPercent: 0.3, monthlyPercent: 9, daysBasis: 'calendar', base: 'earned', minBalance: 100000, frequency: 'daily', startDate: null,
     conditions: 'Returns are a calculated program benefit under the published terms. They are not guaranteed and may be changed or withdrawn.' },
   // Separate program: a monthly % of the principal held, credited to earned income at month end.
   principalReturn: { enabled: false, percent: 2, minPrincipal: 100000,
     conditions: 'Month-end principal return is a program benefit under the published terms. It is not guaranteed and may be changed or withdrawn.' },
   referral: { enabled: false, percent: 10, basis: 'booking_amount', eligibleActivity: 'first_completed_booking', autoApprove: false, bookingEnabled: true,
-    deposit: { enabled: false, percent: 5, eligible: 'first_deposit', minAmount: 0 },
-    holding: { enabled: false, percent: 1, payout: 'month_end' },
-    earning: { enabled: false, percent: 5, payout: 'month_end' } },
+    deposit: { enabled: false, mode: 'percent', percent: 5, fixedAmount: 0, eligible: 'first_deposit', minAmount: 0 },
+    // commission on what each referred user earns; `display` = how the user wallet shows referral commission (daily-wise or overall)
+    earning: { enabled: false, percent: 5, payout: 'month_end', display: 'daily' } },
   wallet: {
     minWithdrawal: 50000, minDeposit: 10000, methods: ['UPI', 'Bank Transfer', 'NEFT/IMPS'], depositInstructions: 'Pay to the account shown by support, then upload the payment proof.',
     tds: { enabled: true, label: 'TDS', percent: 2 }, service: { enabled: true, label: 'Service charges', percent: 2 },
@@ -26,6 +26,8 @@ async function getSettings() { const d = await ApplicationSetting.findOne({ key:
 const daysIn = (d) => new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 0)).getUTCDate();
 // inputMode 'daily': admin types the daily % directly. 'monthly': monthly % is divided into days.
 const dailyPercent = (r, d = new Date()) => (r.inputMode === 'monthly' ? (Number(r.monthlyPercent) || 0) / (r.daysBasis === 'fixed30' ? 30 : daysIn(d)) : Number(r.dailyPercent) || 0);
+// Which wallet field the daily earning is calculated on: principal, balance (total) or earned (earning wallet).
+const baseField = (r) => (r?.base === 'balance' || r?.base === 'earned' ? r.base : 'principal');
 const pad = (n) => String(n).padStart(2, '0');
 const todayStr = (d = new Date()) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`; // server-local date
 const monthStr = (d = new Date()) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}`;
@@ -82,4 +84,4 @@ async function debit(session, { userId, amount, type, note, relatedId, policy = 
 const notify = (session, userId, title, body, link) => Notification.create([{ user: userId, title, body, link }], { session });
 const notifyAdmin = (title, body, link) => Notification.create({ forAdmin: true, title, body, link });
 const audit = (actor, action, target, reason, meta, ip) => AuditLog.create({ actor, action, target, reason, meta, ip });
-module.exports = { getSettings, credit, debit, notify, notifyAdmin, audit, DEFAULTS, dailyPercent, lockInfo, calcFees, todayStr, monthStr, isLastDayOfMonth };
+module.exports = { getSettings, credit, debit, notify, notifyAdmin, audit, DEFAULTS, dailyPercent, baseField, daysIn, lockInfo, calcFees, todayStr, monthStr, isLastDayOfMonth };

@@ -3,14 +3,17 @@ const T = { timestamps: true };
 const ref = (m) => ({ type: Schema.Types.ObjectId, ref: m });
 const sparseUnique = (s, f) => { s.index(f, { unique: true, sparse: true }); return s; };
 
-const User = model('User', new Schema({
+const userSchema = new Schema({
   userId: { type: String, unique: true }, walletId: { type: String, unique: true }, referralCode: { type: String, unique: true },
   name: { type: String, required: true }, username: { type: String, unique: true, required: true, lowercase: true },
-  email: { type: String, unique: true, required: true, lowercase: true }, mobile: String, passwordHash: { type: String, select: false },
+  email: { type: String, lowercase: true, trim: true }, mobile: { type: String, index: true }, passwordHash: { type: String, select: false },
   role: { type: String, enum: ['user', 'admin'], default: 'user', index: true },
-  referredBy: ref('User'), avatar: String, address: String, city: String, state: String, pin: String,
+  referredBy: ref('User'), nominee: { name: String, relation: String, mobile: String, dob: String, address: String }, avatar: String, address: String, city: String, state: String, pin: String,
   status: { type: String, enum: ['active', 'suspended'], default: 'active' },
-}, T));
+}, T);
+// Email is optional now (users log in with their mobile number). It stays unique, but only when one is present.
+userSchema.index({ email: 1 }, { unique: true, name: 'email_unique_when_set', partialFilterExpression: { email: { $type: 'string' } } });
+const User = model('User', userSchema);
 
 // All money is integer paise. balance = principal + earned.
 // principal = deposits / transfers received / admin credits.  earned = daily returns + referral commissions.
@@ -24,7 +27,7 @@ const Wallet = model('Wallet', new Schema({
 
 const txSchema = new Schema({
   user: { ...ref('User'), index: true }, wallet: ref('Wallet'), reference: { type: String, unique: true },
-  type: { type: String, enum: ['deposit', 'withdrawal', 'withdrawal_refund', 'transfer_in', 'transfer_out', 'return', 'referral', 'adjustment'] },
+  type: { type: String, enum: ['deposit', 'withdrawal', 'withdrawal_refund', 'transfer_in', 'transfer_out', 'transfer_refund', 'return', 'referral', 'adjustment'] },
   direction: { type: String, enum: ['credit', 'debit'] }, amount: { type: Number, min: 1 }, balanceAfter: Number,
   principalDelta: { type: Number, default: 0 }, earnedDelta: { type: Number, default: 0 }, note: String, relatedId: String,
 }, T);
@@ -48,9 +51,16 @@ bookingSchema.index({ createdAt: -1 });
 const Booking = model('Booking', bookingSchema);
 
 const Deposit = model('Deposit', sparseUnique(new Schema({
-  user: { ...ref('User'), index: true }, amount: Number, method: String, txnRef: String, proof: String,
+  user: { ...ref('User'), index: true }, amount: Number, method: String, txnRef: String, proof: String, paymentAccount: ref('PaymentAccount'), paidTo: String, target: { type: String, enum: ['principal', 'earned'], default: 'principal' },
   status: { type: String, enum: ['pending', 'approved', 'rejected'], default: 'pending', index: true }, remarks: String, reviewedBy: ref('User'), idemKey: String,
 }, T), { user: 1, idemKey: 1 }));
+
+// Receiving accounts the admin adds (bank or UPI). Users pay into one of these, then submit a deposit request.
+const PaymentAccount = model('PaymentAccount', new Schema({
+  type: { type: String, enum: ['bank', 'upi'], required: true }, label: String,
+  holderName: String, bankName: String, accountNumber: String, ifsc: String, branch: String, accountType: { type: String, enum: ['savings', 'current'], default: 'current' },
+  upiId: String, qrImage: String, note: String, active: { type: Boolean, default: true }, order: { type: Number, default: 0 },
+}, T));
 
 const Withdrawal = model('Withdrawal', sparseUnique(new Schema({
   user: { ...ref('User'), index: true }, bank: ref('BankAccount'), amount: Number,
@@ -63,8 +73,11 @@ const Withdrawal = model('Withdrawal', sparseUnique(new Schema({
 
 const Transfer = model('Transfer', sparseUnique(new Schema({
   reference: { type: String, unique: true }, from: ref('User'), to: ref('User'), fromWalletId: String, toWalletId: String,
-  amount: Number, source: String, lockUntil: Date, note: String, status: { type: String, default: 'completed' }, idemKey: String,
+  amount: Number, source: String, lockUntil: Date, note: String, status: { type: String, enum: ['pending', 'completed', 'rejected'], default: 'pending', index: true }, remarks: String, reviewedBy: ref('User'), idemKey: String,
 }, T), { from: 1, idemKey: 1 }));
+
+// Banners the admin uploads; shown at the top of the user landing page.
+const Banner = model('Banner', new Schema({ image: { type: String, required: true }, title: String, subtitle: String, link: String, active: { type: Boolean, default: true }, order: { type: Number, default: 0 } }, T));
 
 const BankAccount = model('BankAccount', new Schema({
   user: { ...ref('User'), index: true }, holderName: String, bankName: String, accountEnc: String, last4: String, ifsc: String,
@@ -93,4 +106,4 @@ const Notification = model('Notification', new Schema({
 const ApplicationSetting = model('ApplicationSetting', new Schema({ key: { type: String, unique: true }, data: Schema.Types.Mixed }, T));
 const AuditLog = model('AuditLog', new Schema({ actor: ref('User'), action: String, target: String, reason: String, meta: Schema.Types.Mixed, ip: String }, T));
 
-module.exports = { User, Wallet, WalletTransaction, Service, Booking, Deposit, Withdrawal, Transfer, BankAccount, Referral, ReferralCommission, DailyReturn, MonthlyReturn, Notification, ApplicationSetting, AuditLog };
+module.exports = { User, PaymentAccount, Banner, Wallet, WalletTransaction, Service, Booking, Deposit, Withdrawal, Transfer, BankAccount, Referral, ReferralCommission, DailyReturn, MonthlyReturn, Notification, ApplicationSetting, AuditLog };
