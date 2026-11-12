@@ -14,8 +14,9 @@ async function approveCommission(id, actorId) {
   });
 }
 // The unique activityKey makes a second commission for the same activity impossible.
-async function addCommission({ referrer, referred, kind, key, basis, percent, autoApprove, actorId }) {
-  const amount = Math.floor((basis * percent) / 100); if (amount < 1) return null;
+// fixedAmount (paise) pays a flat commission instead of a percentage of the basis.
+async function addCommission({ referrer, referred, kind, key, basis, percent, fixedAmount, autoApprove, actorId }) {
+  const amount = fixedAmount != null ? Math.floor(fixedAmount) : Math.floor((basis * percent) / 100); if (amount < 1) return null;
   try {
     const c = await M.ReferralCommission.create({ referrer, referred, kind, activityKey: key, basis, percent, amount });
     if (autoApprove) await approveCommission(c._id, actorId);
@@ -24,10 +25,11 @@ async function addCommission({ referrer, referred, kind, key, basis, percent, au
 }
 async function depositCommission(dep, actorId) {
   const s = (await getSettings()).referral; const d = s.deposit;
-  if (!s.enabled || !d?.enabled || !(Number(d.percent) > 0)) return null;
+  const fixed = d?.mode === 'fixed';
+  if (!s.enabled || !d?.enabled || !(fixed ? Number(d.fixedAmount) > 0 : Number(d.percent) > 0)) return null;
   const u = await M.User.findById(dep.user); if (!u?.referredBy || String(u.referredBy) === String(u._id)) return null;
   if (dep.amount < (Number(d.minAmount) || 0)) return null;
   if (d.eligible === 'first_deposit' && (await M.Deposit.countDocuments({ user: u._id, status: 'approved', _id: { $ne: dep._id } })) > 0) return null;
-  return addCommission({ referrer: u.referredBy, referred: u._id, kind: 'deposit', key: `dep:${dep._id}`, basis: dep.amount, percent: Number(d.percent), autoApprove: s.autoApprove, actorId });
+  return addCommission({ referrer: u.referredBy, referred: u._id, kind: 'deposit', key: `dep:${dep._id}`, basis: dep.amount, percent: fixed ? 0 : Number(d.percent), fixedAmount: fixed ? Number(d.fixedAmount) : undefined, autoApprove: s.autoApprove, actorId });
 }
 module.exports = { approveCommission, addCommission, depositCommission };

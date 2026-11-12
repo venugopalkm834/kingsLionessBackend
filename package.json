@@ -2,10 +2,28 @@
   "name": "kingandlioness-server",
   "version": "1.0.0",
   "main": "src/server.js",
-  "scripts": { "start": "node src/server.js", "dev": "node --watch src/server.js", "seed": "node src/seed.js", "migrate:userids": "node src/migrate-userids.js" },
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "seed": "node src/seed.js",
+    "migrate:userids": "node src/migrate-userids.js",
+    "check": "node -e \"const{execSync}=require('child_process');const f=require('fs');const w=(d)=>f.readdirSync(d,{withFileTypes:true}).flatMap(e=>e.isDirectory()?w(d+'/'+e.name):e.name.endsWith('.js')?[d+'/'+e.name]:[]);w('src').forEach(x=>execSync('node --check '+x));console.log('syntax ok')\""
+  },
   "dependencies": {
-    "bcryptjs": "^2.4.3", "cors": "^2.8.5", "dotenv": "^16.4.5", "express": "^4.19.2",
-    "express-rate-limit": "^7.4.0", "helmet": "^7.1.0", "jsonwebtoken": "^9.0.2",
-    "mongoose": "^8.6.0", "morgan": "^1.10.0", "multer": "^1.4.5-lts.1", "node-cron": "^3.0.3", "zod": "^3.23.8"
+    "bcryptjs": "^2.4.3",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "express-rate-limit": "^7.4.0",
+    "helmet": "^7.1.0",
+    "jsonwebtoken": "^9.0.2",
+    "mongoose": "^8.6.0",
+    "morgan": "^1.10.0",
+    "multer": "^1.4.5-lts.1",
+    "node-cron": "^3.0.3",
+    "zod": "^3.23.8"
+  },
+  "engines": {
+    "node": ">=18"
   }
 }
