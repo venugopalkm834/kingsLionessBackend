@@ -1,9 +1,9 @@
 const r = require('express').Router();
 const { z } = require('zod');
-const { Service, Booking, Deposit, Withdrawal, Transfer, BankAccount, Wallet, WalletTransaction, DailyReturn, MonthlyReturn, Referral, ReferralCommission, Notification, User } = require('../models');
+const { Service, Booking, Banner, Deposit, PaymentAccount, Withdrawal, Transfer, BankAccount, Wallet, WalletTransaction, DailyReturn, MonthlyReturn, Referral, ReferralCommission, Notification, User } = require('../models');
 const { ids, HttpError, asyncH, withTx, enc, page, inr, fmtDate } = require('../utils/helpers');
 const { auth, validate, idem, upload, uploadAudio } = require('../middleware');
-const { getSettings, credit, debit, notify, notifyAdmin, dailyPercent, lockInfo, calcFees, todayStr } = require('../utils/ledger');
+const { getSettings, credit, debit, notify, notifyAdmin, dailyPercent, baseField, daysIn, lockInfo, calcFees, todayStr } = require('../utils/ledger');
 
 // ---------------- public ----------------
 r.get('/services', asyncH(async (req, res) => res.json(await Service.find({ active: true }).sort({ order: 1 }))));
@@ -12,11 +12,12 @@ r.get('/program-info', asyncH(async (req, res) => {
   res.json({
     returns: { enabled: s.returns.enabled, inputMode: s.returns.inputMode, monthlyPercent: s.returns.monthlyPercent, dailyPercent: dailyPercent(s.returns), daysBasis: s.returns.daysBasis, base: s.returns.base, minBalance: s.returns.minBalance, conditions: s.returns.conditions },
     principalReturn: { enabled: s.principalReturn.enabled, percent: s.principalReturn.percent, minPrincipal: s.principalReturn.minPrincipal, conditions: s.principalReturn.conditions },
-    referral: { enabled: s.referral.enabled, bookingEnabled: s.referral.bookingEnabled, percent: s.referral.percent, eligibleActivity: s.referral.eligibleActivity, deposit: s.referral.deposit, holding: s.referral.holding, earning: s.referral.earning },
+    referral: { enabled: s.referral.enabled, bookingEnabled: s.referral.bookingEnabled, percent: s.referral.percent, eligibleActivity: s.referral.eligibleActivity, deposit: s.referral.deposit, earning: s.referral.earning },
     wallet: { minDeposit: s.wallet.minDeposit, minWithdrawal: s.wallet.minWithdrawal, methods: s.wallet.methods, depositInstructions: s.wallet.depositInstructions, tds: s.wallet.tds, service: s.wallet.service, principalLock: s.wallet.principalLock },
     contact: s.contact,
   });
 }));
+r.get('/banners', asyncH(async (req, res) => res.json(await Banner.find({ active: true }).sort({ order: 1, createdAt: -1 }).select('image title subtitle link'))));
 r.get('/referral/check/:code', asyncH(async (req, res) => { const u = await User.findOne({ referralCode: req.params.code.toUpperCase() }); res.json({ valid: !!u }); }));
 
 r.use(auth);
@@ -57,12 +58,20 @@ r.get('/wallet', asyncH(async (req, res) => {
   const lock = lockInfo(s.wallet.principalLock, w);
   const withdrawable = lock.locked ? w.earned : w.balance;
   const nd = new Date(); const monthEnd = new Date(nd.getFullYear(), nd.getMonth() + 1, 0).toISOString().slice(0, 10);
-  const base = s.returns.base === 'balance' ? w.balance : w.principal; const dp = dailyPercent(s.returns);
-  const eligible = s.returns.enabled && base >= Math.max(1, s.returns.minBalance);
+  const baseKey = baseField(s.returns); const base = w[baseKey]; const dp = dailyPercent(s.returns);
+  const qualifies = base >= Math.max(1, s.returns.minBalance); const eligible = s.returns.enabled && qualifies;
+  // What the admin's rate pays on the chosen base, shown to the user even before the program is switched on.
+  const perDay = qualifies ? Math.floor((base * dp) / 100) : 0;
+  const perMonth = qualifies ? (s.returns.inputMode === 'monthly' ? Math.floor((base * Number(s.returns.monthlyPercent || 0)) / 100) : perDay * daysIn(new Date())) : 0;
+  const start = new Date(); start.setHours(0, 0, 0, 0);
+  const [refAll, refToday] = await Promise.all([WalletTransaction.aggregate([{ $match: { user: req.user._id, type: 'referral' } }, { $group: { _id: null, v: { $sum: '$amount' } } }]),
+    WalletTransaction.aggregate([{ $match: { user: req.user._id, type: 'referral', createdAt: { $gte: start } } }, { $group: { _id: null, v: { $sum: '$amount' } } }])]);
   const pr = s.principalReturn; const expectedMonth = pr.enabled && w.principal >= Math.max(1, pr.minPrincipal) ? Math.floor((w.principal * Number(pr.percent)) / 100) : 0;
   res.json({ wallet: w, lock: { ...lock, withdrawable }, expectedMonthEnd: expectedMonth,
-    settings: { returnsEnabled: s.returns.enabled, inputMode: s.returns.inputMode, principalReturn: s.principalReturn, nextMonthEnd: monthEnd, monthlyPercent: s.returns.monthlyPercent, dailyPercent: dp, minWithdrawal: s.wallet.minWithdrawal, tds: s.wallet.tds, service: s.wallet.service, principalLock: s.wallet.principalLock },
-    todayReturn: today ? today.amount : eligible ? Math.floor((base * dp) / 100) : 0, todayCredited: !!today, recent });
+    settings: { returnsEnabled: s.returns.enabled, inputMode: s.returns.inputMode, daysBasis: s.returns.daysBasis, base: s.returns.base, principalReturn: s.principalReturn, nextMonthEnd: monthEnd, monthlyPercent: s.returns.monthlyPercent, dailyPercent: dp, minWithdrawal: s.wallet.minWithdrawal, tds: s.wallet.tds, service: s.wallet.service, principalLock: s.wallet.principalLock },
+    earning: { baseKey, baseAmount: base, perDay, perMonth, qualifies, minBalance: s.returns.minBalance, totalEarned: w.totalReturns || 0 },
+    referralIncome: { today: refToday[0]?.v || 0, total: refAll[0]?.v || 0, display: s.referral.earning?.display === 'overall' ? 'overall' : 'daily' },
+    todayReturn: today ? today.amount : eligible ? perDay : 0, todayCredited: !!today, recent });
 }));
 r.get('/wallet/transactions', asyncH(async (req, res) => {
   const { p, l, skip } = page(req.query); const q = { user: req.user._id }; if (req.query.type) q.type = req.query.type;
@@ -74,14 +83,22 @@ r.get('/wallet/returns', asyncH(async (req, res) => { const { p, l, skip } = pag
   res.json({ items, total, page: p, limit: l }); }));
 
 const amt = z.coerce.number().int().min(1); // paise
+// Where to pay: the active bank / UPI accounts the admin has added. Shown on the deposit form.
+const publicPay = (a) => ({ _id: a._id, type: a.type, label: a.label, holderName: a.holderName, bankName: a.bankName, accountNumber: a.accountNumber, ifsc: a.ifsc, branch: a.branch,
+  accountType: a.accountType, upiId: a.upiId, qrImage: a.qrImage, note: a.note });
+r.get('/payment-accounts', asyncH(async (req, res) => res.json((await PaymentAccount.find({ active: true }).sort({ order: 1, createdAt: 1 })).map(publicPay))));
+const payName = (a) => (a.type === 'upi' ? `UPI · ${a.upiId}` : `${a.bankName} · •••• ${String(a.accountNumber).slice(-4)}`);
 r.post('/wallet/deposits', upload.single('proof'), asyncH(async (req, res) => {
-  const body = z.object({ amount: amt, method: z.string().min(2), txnRef: z.string().min(4).max(60) }).parse(req.body);
+  const body = z.object({ amount: amt, method: z.string().min(2).max(40), txnRef: z.string().min(4).max(60), paymentAccountId: z.string().min(8), target: z.enum(['principal', 'earned']).default('principal') }).parse(req.body);
   const s = await getSettings();
   if (body.amount < s.wallet.minDeposit) throw new HttpError(400, `Minimum deposit is ${inr(s.wallet.minDeposit)}`);
   const key = idem(req);
   if (key) { const ex = await Deposit.findOne({ user: req.user._id, idemKey: key }); if (ex) return res.json(ex); }
-  const d = await Deposit.create({ ...body, user: req.user._id, proof: req.file ? '/uploads/' + req.file.filename : undefined, idemKey: key });
-  await notifyAdmin('Deposit request', `${req.user.name} requested ${inr(body.amount)}`, '/admin/deposits');
+  const acc = await PaymentAccount.findOne({ _id: body.paymentAccountId, active: true });
+  if (!acc) throw new HttpError(400, 'That payment account is not available. Please pick one from the list.');
+  const { paymentAccountId, ...rest } = body;
+  const d = await Deposit.create({ ...rest, method: acc.type === 'upi' ? 'UPI' : rest.method, paymentAccount: acc._id, paidTo: payName(acc), user: req.user._id, proof: req.file ? '/uploads/' + req.file.filename : undefined, idemKey: key });
+  await notifyAdmin('Deposit request', `${req.user.name} requested ${inr(body.amount)} (to ${body.target} wallet) · paid to ${payName(acc)}`, '/admin/deposits');
   res.status(201).json(d);
 }));
 const paged = (Model, filter, sort, pop) => asyncH(async (req, res) => { const { p, l, skip } = page(req.query); const f = typeof filter === 'function' ? filter(req) : filter;
@@ -131,26 +148,24 @@ r.get('/wallet/lookup', asyncH(async (req, res) => {
   const u = await findRecipient(req, req.query.by === 'mobile' ? 'mobile' : 'userId', req.query.value);
   res.json({ name: u.name, userId: u.userId, mobile: u.mobile ? `******${String(u.mobile).slice(-4)}` : '' });
 }));
-r.post('/wallet/transfers', validate(z.object({ by: z.enum(['userId', 'mobile', 'walletId']).default('userId'), value: z.string().optional(), walletId: z.string().optional(), source: z.enum(['principal', 'earned']).default('principal'), amount: amt, note: z.string().max(200).optional() })), asyncH(async (req, res) => {
+// Transfers: only EARNED income can be sent, and every transfer waits for admin approval.
+// The amount is held (debited) from the sender when requested; the recipient is credited when an admin approves;
+// a rejection refunds the sender in full.
+r.post('/wallet/transfers', validate(z.object({ by: z.enum(['userId', 'mobile', 'walletId']).default('userId'), value: z.string().optional(), walletId: z.string().optional(), source: z.enum(['principal', 'earned']).default('earned'), amount: amt, note: z.string().max(200).optional() })), asyncH(async (req, res) => {
   const { amount, note, source } = req.body; const by = req.body.by; const value = req.body.value || req.body.walletId; const key = idem(req);
+  if (source !== 'earned') throw new HttpError(400, 'Principal cannot be transferred. Only earned income can be transferred.');
   if (key) { const ex = await Transfer.findOne({ from: req.user._id, idemKey: key }); if (ex) return res.json(ex); }
   const to = await findRecipient(req, by, value);
-  const st = await getSettings();
   const t = await withTx(async (s) => {
     const reference = ids.txn('TRF');
-    // Principal sent while locked stays locked for the receiver until the sender's unlock date. Earned income stays earned.
-    let lockUntil = null;
-    if (source === 'principal') { const w = await Wallet.findOne({ user: req.user._id }).session(s); const li = lockInfo(st.wallet.principalLock, w); if (li.locked && li.unlockAt) lockUntil = li.unlockAt; }
-    const [tr] = await Transfer.create([{ reference, from: req.user._id, to: to._id, fromWalletId: req.user.walletId, toWalletId: to.walletId, amount, source, lockUntil, note, idemKey: key }], { session: s });
-    const label = source === 'earned' ? 'earned income' : 'principal';
-    await debit(s, { userId: req.user._id, amount, policy: source, type: 'transfer_out', note: `To ${to.userId} (${label})`, relatedId: reference, totals: { totalTransfers: amount } });
-    await credit(s, { userId: to._id, amount, bucket: source, lockUntil, type: 'transfer_in', note: `From ${req.user.userId} (${label})`, relatedId: reference });
-    await notify(s, to._id, 'Funds received', `${inr(amount)} ${label} from ${req.user.name}${lockUntil ? ' · locked until ' + fmtDate(lockUntil) : ''}`, '/wallet');
+    const [tr] = await Transfer.create([{ reference, from: req.user._id, to: to._id, fromWalletId: req.user.walletId, toWalletId: to.walletId, amount, source: 'earned', note, status: 'pending', idemKey: key }], { session: s });
+    await debit(s, { userId: req.user._id, amount, policy: 'earned', type: 'transfer_out', note: `To ${to.userId} (awaiting admin approval)`, relatedId: reference });
     return tr;
   });
+  await notifyAdmin('Transfer request', `${req.user.name} → ${to.name} (${to.userId}) ${inr(amount)}`, '/admin/transfers');
   res.status(201).json({ ...t.toObject(), recipientName: to.name, toUserId: to.userId, fromWalletId: undefined, toWalletId: undefined });
 }));
-r.get('/wallet/transfers', asyncH(async (req, res) => { const { p, l, skip } = page(req.query); const f = { $or: [{ from: req.user._id }, { to: req.user._id }] };
+r.get('/wallet/transfers', asyncH(async (req, res) => { const { p, l, skip } = page(req.query); const f = { $or: [{ from: req.user._id }, { to: req.user._id, status: 'completed' }] }; // a pending transfer is not shown to the recipient yet
   const [rows, total] = await Promise.all([Transfer.find(f).populate('from to', 'name userId').sort({ createdAt: -1 }).skip(skip).limit(l), Transfer.countDocuments(f)]);
   res.json({ items: rows.map((t) => ({ ...t.toObject(), fromWalletId: undefined, toWalletId: undefined, direction: String(t.from._id) === String(req.user._id) ? 'sent' : 'received' })), total, page: p, limit: l }); }));
 r.get('/wallet/monthly-returns', paged(MonthlyReturn, (req) => ({ user: req.user._id }), { month: -1 }));
@@ -181,15 +196,26 @@ r.delete('/banks/:id', asyncH(async (req, res) => {
 
 // ---------------- referrals ----------------
 r.get('/referrals', asyncH(async (req, res) => {
-  const [refs, comms, s] = await Promise.all([Referral.find({ referrer: req.user._id }).populate('referred', 'name userId createdAt').sort({ createdAt: -1 }),
-    ReferralCommission.find({ referrer: req.user._id }), getSettings()]);
+  const [refs, comms, s, parent] = await Promise.all([Referral.find({ referrer: req.user._id }).populate('referred', 'name userId createdAt').sort({ createdAt: -1 }),
+    ReferralCommission.find({ referrer: req.user._id }), getSettings(), req.user.referredBy ? User.findById(req.user.referredBy).select('name userId') : null]);
   const sum = (st) => comms.filter((c) => st.includes(c.status)).reduce((a, c) => a + c.amount, 0);
   const by = (k) => comms.filter((c) => (c.kind || 'booking') === k && c.status === 'approved').reduce((a, c) => a + c.amount, 0);
-  res.json({ code: req.user.referralCode, program: s.referral, breakdown: { booking: by('booking'), deposit: by('deposit'), holding: by('holding'), earning: by('earning') }, total: refs.length, earned: sum(['approved']), eligible: sum(['pending']),
-    list: refs.filter((x) => x.referred).map((x) => { const c = comms.filter((c2) => String(c2.referred) === String(x.referred._id));
-      return { name: x.referred.name, userId: x.referred.userId, joined: x.referred.createdAt, status: c.length ? 'active' : 'registered',
-        commission: c.reduce((a, b) => a + b.amount, 0), commissionStatus: c[0]?.status || '—' }; }) });
+  const kids = refs.filter((x) => x.referred);
+  // second level: the people each of my direct referrals brought in
+  const grand = await Referral.find({ referrer: { $in: kids.map((k) => k.referred._id) } }).populate('referred', 'name userId');
+  res.json({ code: req.user.referralCode, program: s.referral, parent: parent ? { name: parent.name, userId: parent.userId } : null,
+    breakdown: { booking: by('booking'), deposit: by('deposit'), earning: by('earning') }, total: refs.length, earned: sum(['approved']), eligible: sum(['pending']),
+    list: kids.map((x) => { const c = comms.filter((c2) => String(c2.referred) === String(x.referred._id));
+      const children = grand.filter((g) => String(g.referrer) === String(x.referred._id) && g.referred).map((g) => ({ name: g.referred.name, userId: g.referred.userId }));
+      return { name: x.referred.name, userId: x.referred.userId, joined: x.referred.createdAt, status: c.length ? 'active' : 'registered', children,
+        commission: c.filter((k) => k.status === 'approved').reduce((a, b) => a + b.amount, 0), pendingCommission: c.filter((k) => k.status === 'pending').reduce((a, b) => a + b.amount, 0), commissionStatus: c[0]?.status || '—' }; }) });
 }));
+
+// ---------------- nominee ----------------
+const nomineeSchema = z.object({ name: z.string().trim().min(2).max(80), relation: z.string().trim().min(2).max(40), mobile: z.string().regex(/^[6-9]\d{9}$/, 'Enter a valid 10-digit mobile').optional().or(z.literal('')),
+  dob: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'Use a valid date').optional().or(z.literal('')), address: z.string().trim().max(300).optional() });
+r.put('/nominee', validate(nomineeSchema), asyncH(async (req, res) => { req.user.nominee = req.body; await req.user.save(); res.json(req.user.nominee); }));
+r.delete('/nominee', asyncH(async (req, res) => { req.user.nominee = undefined; await req.user.save(); res.json({ ok: true }); }));
 
 // ---------------- notifications / profile ----------------
 r.get('/notifications', asyncH(async (req, res) => res.json(await Notification.find({ user: req.user._id }).sort({ createdAt: -1 }).limit(50))));
