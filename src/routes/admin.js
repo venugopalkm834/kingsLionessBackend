@@ -3,7 +3,7 @@ const { z } = require('zod');
 const M = require('../models');
 const { HttpError, asyncH, withTx, page, dec, inr } = require('../utils/helpers');
 const { auth, role, validate, upload } = require('../middleware');
-const { getSettings, credit, debit, notify, audit, dailyPercent } = require('../utils/ledger');
+const { getSettings, credit, debit, notify, audit, dailyPercent, lockInfo, lockDate } = require('../utils/ledger');
 const { runDailyReturns, runMonthEnd } = require('../utils/returns');
 const { approveCommission, addCommission, depositCommission } = require('../utils/referral');
 r.use(auth, role('admin'));
@@ -58,8 +58,9 @@ r.patch('/bookings/:id', validate(z.object({ status: z.enum(['pending', 'confirm
     await b.save();
     if (changed) {
       await M.Notification.create({ user: b.user, title: `Booking ${b.bookingId}: ${status.replace('_', ' ')}`, body: remarks || '', link: '/bookings' });
-      if (status === 'completed') await maybeCommission(b, req.user._id);
     }
+    // Also when the admin fills in the amount AFTER completing the booking: the commission is safe to attempt again (unique key per activity).
+    if (b.status === 'completed' && (changed || amount !== undefined)) await maybeCommission(b, req.user._id);
     await audit(req.user._id, 'booking.update', b.bookingId, remarks, { status, amount }, req.ip);
     res.json(b);
   }));
@@ -85,13 +86,13 @@ r.get('/users/:id', asyncH(async (req, res) => {
   res.json({ user: u, wallet, bookings, transactions: txs });
 }));
 const userEdit = z.object({
-  name: z.string().min(2).max(80).optional(), username: z.string().min(3).max(24).regex(/^[a-z0-9_]+$/i).optional(), email: z.string().email().optional(),
+  name: z.string().min(2).max(80).optional(), username: z.string().min(3).max(24).regex(/^[a-z0-9_]+$/i).optional(), email: z.string().email().optional().or(z.literal('')),
   mobile: z.string().regex(/^[6-9]\d{9}$/, 'Enter a valid 10-digit mobile').optional(), address: z.string().max(300).optional(), city: z.string().max(80).optional(), state: z.string().max(80).optional(),
   pin: z.string().regex(/^\d{6}$/).optional().or(z.literal('')), status: z.enum(['active', 'suspended']).optional(), newPassword: z.string().min(8).regex(/^(?=.*[A-Za-z])(?=.*\d)/, 'Password needs a letter and a number').optional() });
 r.patch('/users/:id', validate(userEdit), asyncH(async (req, res) => {
   const u = await M.User.findOne({ _id: req.params.id, role: 'user' }); if (!u) throw new HttpError(404, 'User not found');
   const { newPassword, ...b } = req.body; const changed = {};
-  if (b.username) b.username = b.username.toLowerCase(); if (b.email) b.email = b.email.toLowerCase();
+  if (b.username) b.username = b.username.toLowerCase(); if (b.email === '') delete b.email; if (b.email) b.email = b.email.toLowerCase(); // email is optional: blank = leave as is
   for (const k of ['username', 'email', 'mobile']) if (b[k] && b[k] !== u[k] && (await M.User.exists({ [k]: b[k], _id: { $ne: u._id } }))) throw new HttpError(409, `This ${k} is already used by another account`);
   for (const k of Object.keys(b)) if (b[k] !== undefined && b[k] !== u[k]) { changed[k] = [u[k], b[k]]; u[k] = b[k]; }
   if (newPassword) { u.passwordHash = await require('bcryptjs').hash(newPassword, 12); changed.password = 'reset'; }
@@ -118,17 +119,59 @@ r.put('/services/:id', upload.single('image'), asyncH(async (req, res) => {
 r.patch('/services/:id/toggle', asyncH(async (req, res) => { const s = await M.Service.findById(req.params.id); if (!s) throw new HttpError(404, 'Service not found'); s.active = !s.active; await s.save(); res.json(s); }));
 r.delete('/services/:id', asyncH(async (req, res) => { await M.Service.findByIdAndDelete(req.params.id); res.json({ ok: true }); }));
 
+// ---------------- payment accounts (bank / UPI that users deposit into) ----------------
+const payBase = z.object({
+  type: z.enum(['bank', 'upi']), label: z.string().max(60).optional(), note: z.string().max(300).optional(),
+  holderName: z.string().max(80).optional(), bankName: z.string().max(80).optional(), accountNumber: z.string().optional(), ifsc: z.string().optional(),
+  branch: z.string().max(80).optional(), accountType: z.enum(['savings', 'current']).optional(), upiId: z.string().optional(),
+});
+const parsePay = (body) => {
+  const b = payBase.parse(body); const t = (v) => (v || '').trim();
+  if (b.type === 'bank') {
+    if (t(b.holderName).length < 2) throw new HttpError(422, 'Account holder name is required');
+    if (t(b.bankName).length < 2) throw new HttpError(422, 'Bank name is required');
+    if (!/^\d{9,18}$/.test(t(b.accountNumber))) throw new HttpError(422, 'Account number must be 9 to 18 digits');
+    if (!/^[A-Za-z]{4}0[A-Za-z0-9]{6}$/.test(t(b.ifsc))) throw new HttpError(422, 'Invalid IFSC (example: HDFC0001234)');
+    return { type: 'bank', label: t(b.label), note: t(b.note), holderName: t(b.holderName), bankName: t(b.bankName), accountNumber: t(b.accountNumber), ifsc: t(b.ifsc).toUpperCase(), branch: t(b.branch), accountType: b.accountType || 'current', upiId: '' };
+  }
+  if (!/^[\w.\-]{2,64}@[A-Za-z][A-Za-z0-9]{1,30}$/.test(t(b.upiId))) throw new HttpError(422, 'Enter a valid UPI ID (example: name@okbank)');
+  return { type: 'upi', label: t(b.label), note: t(b.note), holderName: t(b.holderName), upiId: t(b.upiId).toLowerCase(), bankName: '', accountNumber: '', ifsc: '', branch: '' };
+};
+r.get('/payment-accounts', asyncH(async (req, res) => res.json(await M.PaymentAccount.find().sort({ order: 1, createdAt: 1 }))));
+r.post('/payment-accounts', upload.single('qr'), asyncH(async (req, res) => {
+  const d = parsePay(req.body); const count = await M.PaymentAccount.countDocuments();
+  if (req.file && !req.file.mimetype.startsWith('image/')) throw new HttpError(400, 'The QR code must be an image');
+  const acc = await M.PaymentAccount.create({ ...d, order: count, active: req.body.active === undefined ? true : strBool(req.body.active), qrImage: req.file ? '/uploads/' + req.file.filename : undefined });
+  await audit(req.user._id, 'payment_account.create', String(acc._id), null, { type: acc.type, label: acc.label }, req.ip); res.status(201).json(acc);
+}));
+r.put('/payment-accounts/:id', upload.single('qr'), asyncH(async (req, res) => {
+  const d = parsePay(req.body); const set = { ...d, active: strBool(req.body.active) };
+  if (req.file) { if (!req.file.mimetype.startsWith('image/')) throw new HttpError(400, 'The QR code must be an image'); set.qrImage = '/uploads/' + req.file.filename; }
+  if (strBool(req.body.removeQr) && !req.file) set.qrImage = '';
+  const acc = await M.PaymentAccount.findByIdAndUpdate(req.params.id, set, { new: true }); if (!acc) throw new HttpError(404, 'Payment account not found');
+  await audit(req.user._id, 'payment_account.update', String(acc._id), null, { type: acc.type, label: acc.label }, req.ip); res.json(acc);
+}));
+r.patch('/payment-accounts/:id/toggle', asyncH(async (req, res) => {
+  const acc = await M.PaymentAccount.findById(req.params.id); if (!acc) throw new HttpError(404, 'Payment account not found');
+  acc.active = !acc.active; await acc.save(); await audit(req.user._id, 'payment_account.' + (acc.active ? 'enable' : 'disable'), String(acc._id), null, null, req.ip); res.json(acc);
+}));
+r.delete('/payment-accounts/:id', asyncH(async (req, res) => {
+  await M.PaymentAccount.findByIdAndDelete(req.params.id); await audit(req.user._id, 'payment_account.delete', req.params.id, null, null, req.ip); res.json({ ok: true });
+}));
+
 // ---------------- deposits ----------------
-r.get('/deposits', asyncH(async (req, res) => res.json(await list(M.Deposit, req, { populate: { path: 'user', select: uref }, search: ['txnRef'] }))));
-r.patch('/deposits/:id', validate(z.object({ status: z.enum(['approved', 'rejected']), remarks: z.string().max(300).optional() })), asyncH(async (req, res) => {
+r.get('/deposits', asyncH(async (req, res) => res.json(await list(M.Deposit, req, { populate: { path: 'user', select: uref }, search: ['txnRef', 'paidTo'] }))));
+const lockChoice = z.object({ mode: z.enum(['default', 'days', 'months', 'date']).default('default'), days: z.coerce.number().optional(), months: z.coerce.number().optional(), date: z.string().nullable().optional() });
+r.patch('/deposits/:id', validate(z.object({ status: z.enum(['approved', 'rejected']), remarks: z.string().max(300).optional(), lock: lockChoice.optional() })), asyncH(async (req, res) => {
+  const lockUntil = req.body.status === 'approved' && req.body.lock ? lockDate(req.body.lock) : null; // validated before anything changes
   const out = await withTx(async (s) => {
     const d = await M.Deposit.findOneAndUpdate({ _id: req.params.id, status: 'pending' }, { status: req.body.status, remarks: req.body.remarks, reviewedBy: req.user._id }, { new: true, session: s });
     if (!d) throw new HttpError(409, 'Already processed');
-    if (d.status === 'approved') await credit(s, { userId: d.user, amount: d.amount, bucket: 'principal', touchDeposit: true, type: 'deposit', note: 'Deposit approved', relatedId: String(d._id), totals: { totalDeposits: d.amount } });
+    if (d.status === 'approved') await credit(s, { userId: d.user, amount: d.amount, bucket: d.target === 'earned' ? 'earned' : 'principal', touchDeposit: d.target !== 'earned', lockUntil: d.target !== 'earned' ? lockUntil : null, type: 'deposit', note: `Deposit approved (${d.target === 'earned' ? 'earned' : 'principal'} wallet)`, relatedId: String(d._id), totals: { totalDeposits: d.amount } });
     await notify(s, d.user, `Deposit ${d.status}`, d.remarks || inr(d.amount), '/wallet'); return d;
   });
   if (out.status === 'approved') await depositCommission(out, req.user._id).catch((e) => console.error('deposit commission', e));
-  await audit(req.user._id, 'deposit.' + out.status, String(out._id), req.body.remarks, { amount: out.amount }, req.ip); res.json(out);
+  await audit(req.user._id, 'deposit.' + out.status, String(out._id), req.body.remarks, { amount: out.amount, lockUntil }, req.ip); res.json(out);
 }));
 
 // ---------------- withdrawals ----------------
@@ -147,14 +190,50 @@ r.patch('/withdrawals/:id', validate(z.object({ status: z.enum(['approved', 'pro
 }));
 
 // ---------------- transfers / transactions / wallets ----------------
-r.get('/transfers', asyncH(async (req, res) => res.json(await list(M.Transfer, req, { populate: [{ path: 'from', select: 'name userId' }, { path: 'to', select: 'name userId' }], search: ['reference', 'fromWalletId', 'toWalletId'], keys: [] }))));
+r.get('/transfers', asyncH(async (req, res) => res.json(await list(M.Transfer, req, { populate: [{ path: 'from', select: 'name userId' }, { path: 'to', select: 'name userId' }], search: ['reference', 'fromWalletId', 'toWalletId'] }))));
+// Approve = credit the recipient's earned income. Reject = refund the sender. Either happens once (status must be pending).
+r.patch('/transfers/:id', validate(z.object({ status: z.enum(['completed', 'rejected']), remarks: z.string().max(300).optional() })), asyncH(async (req, res) => {
+  const out = await withTx(async (s) => {
+    const cur = await M.Transfer.findById(req.params.id).session(s); if (!cur || cur.status !== 'pending') throw new HttpError(409, 'Already processed');
+    const to = await M.User.findById(cur.to).session(s);
+    // check before changing anything, so a refused approval leaves the transfer pending
+    if (req.body.status === 'completed' && (!to || to.status !== 'active')) throw new HttpError(409, 'The recipient account is not active. Reject this transfer to refund the sender.');
+    const t = await M.Transfer.findOneAndUpdate({ _id: req.params.id, status: 'pending' }, { status: req.body.status, remarks: req.body.remarks, reviewedBy: req.user._id }, { new: true, session: s });
+    if (!t) throw new HttpError(409, 'Already processed');
+    if (t.status === 'completed') {
+      await credit(s, { userId: t.to, amount: t.amount, bucket: 'earned', type: 'transfer_in', note: `From ${(await M.User.findById(t.from).session(s))?.userId} (earned income)`, relatedId: t.reference });
+      await M.Wallet.updateOne({ user: t.from }, { $inc: { totalTransfers: t.amount } }, { session: s });
+      await notify(s, t.to, 'Funds received', `${inr(t.amount)} earned income`, '/wallet');
+      await notify(s, t.from, 'Transfer approved', `${inr(t.amount)} sent to ${to.userId}`, '/wallet');
+    } else {
+      await credit(s, { userId: t.from, amount: t.amount, bucket: 'earned', type: 'transfer_refund', note: 'Transfer rejected, refunded', relatedId: t.reference });
+      await notify(s, t.from, 'Transfer rejected', t.remarks || `${inr(t.amount)} refunded to your earned income`, '/wallet');
+    }
+    return t;
+  });
+  await audit(req.user._id, 'transfer.' + out.status, out.reference, req.body.remarks, { amount: out.amount }, req.ip); res.json(out);
+}));
 r.get('/transactions', asyncH(async (req, res) => res.json(await list(M.WalletTransaction, req, { populate: { path: 'user', select: 'name userId walletId' }, search: ['reference', 'note'], keys: ['type'] }))));
 r.get('/wallets', asyncH(async (req, res) => {
   const f = {};
   if (req.query.search) { const us = await M.User.find({ $or: [{ walletId: rx(req.query.search) }, { mobile: rx(req.query.search) }, { name: rx(req.query.search) }, { userId: rx(req.query.search) }] }).select('_id'); f.user = { $in: us.map((u) => u._id) }; }
   const { p, l, skip } = page(req.query);
   const [items, total] = await Promise.all([M.Wallet.find(f).populate('user', 'name userId').sort({ balance: -1 }).skip(skip).limit(l), M.Wallet.countDocuments(f)]);
-  res.json({ items, total, page: p, limit: l });
+  const L = (await getSettings()).wallet.principalLock;
+  res.json({ items: items.map((w) => ({ ...w.toObject(), lock: lockInfo(L, w) })), total, page: p, limit: l });
+}));
+// Admin sets when one user's principal unlocks: {mode:'unlock'} now, 'days'/'months' from today, a fixed 'date', or 'default' (back to the Settings rule).
+r.put('/wallets/:userId/lock', validate(z.object({ mode: z.enum(['unlock', 'default', 'days', 'months', 'date']), days: z.coerce.number().optional(), months: z.coerce.number().optional(), date: z.string().nullable().optional() })), asyncH(async (req, res) => {
+  const { mode } = req.body; let set;
+  if (mode === 'default') set = { lockManual: false, lockUntil: null };
+  else if (mode === 'unlock') set = { lockManual: true, lockUntil: new Date() };
+  else set = { lockManual: true, lockUntil: lockDate(req.body) };
+  const w = await M.Wallet.findOneAndUpdate({ user: req.params.userId }, { $set: set }, { new: true });
+  if (!w) throw new HttpError(404, 'Wallet not found');
+  const info = lockInfo((await getSettings()).wallet.principalLock, w);
+  await audit(req.user._id, 'wallet.lock', String(req.params.userId), mode, { unlockAt: info.unlockAt }, req.ip);
+  await M.Notification.create({ user: w.user, title: info.locked ? 'Principal lock updated' : 'Principal unlocked', body: info.locked && info.unlockAt ? 'Your principal unlocks on ' + info.unlockAt.toISOString().slice(0, 10) : 'Your full balance can now be withdrawn.', link: '/wallet' });
+  res.json({ ...w.toObject(), lock: info });
 }));
 const findByRef = async (ref) => {
   const v = String(ref || '').trim(); const up = v.toUpperCase(); const digits = v.replace(/\D/g, '').slice(-10);
@@ -215,29 +294,51 @@ r.get('/monthly-returns', asyncH(async (req, res) => res.json(await list(M.Month
 r.post('/returns/run-month-end', asyncH(async (req, res) => { const out = await runMonthEnd({ force: true }); await audit(req.user._id, 'returns.month_end', out.month || '', null, out, req.ip); res.json(out); }));
 r.post('/returns/run', asyncH(async (req, res) => { const out = await runDailyReturns(); await audit(req.user._id, 'returns.run', out.date || '', null, out, req.ip); res.json(out); }));
 
+// ---------------- banners (landing page) ----------------
+const bannerBody = z.object({ title: z.string().max(80).optional(), subtitle: z.string().max(160).optional(), link: z.string().max(300).optional() });
+const imgOnly = (f) => { if (f && !f.mimetype.startsWith('image/')) throw new HttpError(400, 'The banner must be an image (PNG, JPG or WEBP)'); };
+r.get('/banners', asyncH(async (req, res) => res.json(await M.Banner.find().sort({ order: 1, createdAt: -1 }))));
+r.post('/banners', upload.single('image'), asyncH(async (req, res) => {
+  if (!req.file) throw new HttpError(400, 'Choose a banner image'); imgOnly(req.file); const b = bannerBody.parse(req.body); const count = await M.Banner.countDocuments();
+  const doc = await M.Banner.create({ ...b, image: '/uploads/' + req.file.filename, order: count, active: req.body.active === undefined ? true : strBool(req.body.active) });
+  await audit(req.user._id, 'banner.create', String(doc._id), null, null, req.ip); res.status(201).json(doc);
+}));
+r.put('/banners/:id', upload.single('image'), asyncH(async (req, res) => {
+  imgOnly(req.file); const b = bannerBody.parse(req.body); const set = { ...b, active: strBool(req.body.active), order: Number(req.body.order) || 0 }; if (req.file) set.image = '/uploads/' + req.file.filename;
+  const doc = await M.Banner.findByIdAndUpdate(req.params.id, set, { new: true }); if (!doc) throw new HttpError(404, 'Banner not found'); res.json(doc);
+}));
+r.patch('/banners/:id/toggle', asyncH(async (req, res) => { const b = await M.Banner.findById(req.params.id); if (!b) throw new HttpError(404, 'Banner not found'); b.active = !b.active; await b.save(); res.json(b); }));
+r.delete('/banners/:id', asyncH(async (req, res) => { await M.Banner.findByIdAndDelete(req.params.id); await audit(req.user._id, 'banner.delete', req.params.id, null, null, req.ip); res.json({ ok: true }); }));
+
 // ---------------- settings / notifications ----------------
 const pct = (max) => z.coerce.number().min(0).max(max);
 const feeRow = z.object({ enabled: z.boolean(), label: z.string().min(1).max(40), percent: pct(50) });
 r.get('/settings', asyncH(async (req, res) => { const s = await getSettings(); res.json({ ...s, preview: { dailyPercent: dailyPercent(s.returns) } }); }));
 r.put('/settings', validate(z.object({
-  returns: z.object({ enabled: z.boolean(), inputMode: z.enum(['daily', 'monthly']).default('daily'), dailyPercent: pct(10).default(0), monthlyPercent: pct(60), daysBasis: z.enum(['calendar', 'fixed30']), base: z.enum(['principal', 'balance']), minBalance: z.coerce.number().int().min(0), frequency: z.literal('daily').default('daily'), startDate: z.string().nullable().optional(), conditions: z.string().max(1500) }),
+  returns: z.object({ enabled: z.boolean(), inputMode: z.enum(['daily', 'monthly']).default('daily'), dailyPercent: pct(10).default(0), monthlyPercent: pct(60), daysBasis: z.enum(['calendar', 'fixed30']), base: z.enum(['principal', 'balance', 'earned']), minBalance: z.coerce.number().int().min(0), frequency: z.literal('daily').default('daily'), startDate: z.string().nullable().optional(), conditions: z.string().max(1500) }),
   principalReturn: z.object({ enabled: z.boolean(), percent: pct(100), minPrincipal: z.coerce.number().int().min(0), conditions: z.string().max(1500) }),
   referral: z.object({ enabled: z.boolean(), bookingEnabled: z.boolean().default(true), percent: pct(50), basis: z.literal('booking_amount').default('booking_amount'), eligibleActivity: z.enum(['first_completed_booking', 'every_completed_booking']), autoApprove: z.boolean(),
-    deposit: z.object({ enabled: z.boolean(), percent: pct(50), eligible: z.enum(['first_deposit', 'every_deposit']), minAmount: z.coerce.number().int().min(0) }),
-    holding: z.object({ enabled: z.boolean(), percent: pct(50), payout: z.enum(['daily', 'month_end']).default('month_end') }),
-    earning: z.object({ enabled: z.boolean(), percent: pct(50), payout: z.enum(['daily', 'month_end']).default('month_end') }) }),
+    deposit: z.object({ enabled: z.boolean(), mode: z.enum(['percent', 'fixed']).default('percent'), percent: pct(50), fixedAmount: z.coerce.number().int().min(0).default(0), eligible: z.enum(['first_deposit', 'every_deposit']), minAmount: z.coerce.number().int().min(0) }),
+    earning: z.object({ enabled: z.boolean(), percent: pct(50), payout: z.enum(['daily', 'month_end']).default('month_end'), display: z.enum(['daily', 'overall']).default('daily') }) }),
   wallet: z.object({ minWithdrawal: z.coerce.number().int().min(100), minDeposit: z.coerce.number().int().min(100), methods: z.array(z.string()).min(1), depositInstructions: z.string().max(600),
     tds: feeRow, service: feeRow, principalLock: z.object({ enabled: z.boolean(), mode: z.enum(['days', 'date']), days: z.coerce.number().int().min(0).max(3650), date: z.string().nullable().optional() }) }),
   contact: z.object({ whatsapp: z.string().regex(/^\d{8,15}$/, 'WhatsApp number: digits only with country code, e.g. 919876543210'), message: z.string().max(200), phone: z.string().max(40), email: z.string().max(120), address: z.string().max(200) }),
   legalReviewConfirmed: z.boolean().optional() })), asyncH(async (req, res) => {
   const { legalReviewConfirmed, ...data } = req.body; const cur = await getSettings();
   const on = (n, o) => n?.enabled && !o?.enabled;
-  const enabling = on(data.returns, cur.returns) || on(data.principalReturn, cur.principalReturn) || on(data.referral, cur.referral) || on(data.referral.deposit, cur.referral.deposit) || on(data.referral.holding, cur.referral.holding) || on(data.referral.earning, cur.referral.earning);
+  const enabling = on(data.returns, cur.returns) || on(data.principalReturn, cur.principalReturn) || on(data.referral, cur.referral) || on(data.referral.deposit, cur.referral.deposit) || on(data.referral.earning, cur.referral.earning);
   if (enabling && !legalReviewConfirmed) throw new HttpError(400, 'Tick the confirmation that legal/regulatory review is complete before switching on earnings or referral payouts');
   if (data.wallet.principalLock.enabled && data.wallet.principalLock.mode === 'date' && !data.wallet.principalLock.date) throw new HttpError(400, 'Choose the date until which principal stays locked');
   await M.ApplicationSetting.findOneAndUpdate({ key: 'app' }, { key: 'app', data }, { upsert: true });
   await audit(req.user._id, 'settings.update', 'app', null, data, req.ip); res.json(await getSettings());
 }));
+// Full Aadhaar / PAN are shown only on request, and every view is written to the audit log.
+r.get('/users/:id/kyc', asyncH(async (req, res) => {
+  const u = await M.User.findById(req.params.id).select('+aadhaarEnc +panEnc name userId'); if (!u) throw new HttpError(404, 'User not found');
+  await audit(req.user._id, 'user.kyc_view', u.userId, null, null, req.ip);
+  res.json({ aadhaar: u.aadhaarEnc ? dec(u.aadhaarEnc) : null, pan: u.panEnc ? dec(u.panEnc) : null });
+}));
+r.get('/notifications/unread', asyncH(async (req, res) => res.json({ count: await M.Notification.countDocuments({ forAdmin: true, read: false }) })));
 r.get('/notifications', asyncH(async (req, res) => res.json(await M.Notification.find({ forAdmin: true }).sort({ createdAt: -1 }).limit(50))));
-r.post('/notifications/read-all', asyncH(async (req, res) => { await M.Notification.updateMany({ forAdmin: true }, { read: true }); res.json({ ok: true }); }));
+r.post('/notifications/read-all', asyncH(async (req, res) => { await M.Notification.updateMany({ forAdmin: true, read: false }, { read: true }); res.json({ ok: true }); }));
 module.exports = r;

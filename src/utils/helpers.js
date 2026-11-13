@@ -35,7 +35,14 @@ const dec = (s) => {
   const c = crypto.createDecipheriv('aes-256-gcm', key(), iv); c.setAuthTag(tag);
   return Buffer.concat([c.update(d), c.final()]).toString('utf8');
 };
+// Identity numbers. Aadhaar: 12 digits, first digit 2-9, last digit is a Verhoeff check digit (catches typing mistakes). PAN: AAAAA9999A.
+const VD = [[0,1,2,3,4,5,6,7,8,9],[1,2,3,4,0,6,7,8,9,5],[2,3,4,0,1,7,8,9,5,6],[3,4,0,1,2,8,9,5,6,7],[4,0,1,2,3,9,5,6,7,8],[5,9,8,7,6,0,4,3,2,1],[6,5,9,8,7,1,0,4,3,2],[7,6,5,9,8,2,1,0,4,3],[8,7,6,5,9,3,2,1,0,4],[9,8,7,6,5,4,3,2,1,0]];
+const VP = [[0,1,2,3,4,5,6,7,8,9],[1,5,7,6,2,8,3,0,9,4],[5,8,0,3,7,9,6,1,4,2],[8,9,1,6,0,4,3,5,2,7],[9,4,5,3,1,2,6,8,7,0],[4,2,8,6,5,7,3,9,0,1],[2,7,9,3,8,0,6,4,1,5],[7,0,4,6,9,1,3,2,5,8]];
+const verhoeff = (num) => { let c = 0; const a = String(num).split('').reverse().map(Number); for (let i = 0; i < a.length; i++) c = VD[c][VP[i % 8][a[i]]]; return c === 0; };
+const isAadhaar = (v) => /^[2-9]\d{11}$/.test(v) && verhoeff(v);
+const isPan = (v) => /^[A-Z]{3}[ABCFGHLJPTK][A-Z]\d{4}[A-Z]$/.test(v);
+const idHash = (kind, v) => crypto.createHmac('sha256', String(process.env.ENC_KEY || '')).update(kind + ':' + v).digest('hex');
 const page = (q) => { const p = Math.max(1, +q.page || 1); const l = Math.min(100, Math.max(1, +q.limit || 10)); return { p, l, skip: (p - 1) * l }; };
 const inr = (paise) => '₹' + ((paise || 0) / 100).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const fmtDate = (d) => new Date(d).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' });
-module.exports = { ids, HttpError, asyncH, withTx, txState, enc, dec, page, inr, fmtDate };
+module.exports = { ids, HttpError, asyncH, withTx, txState, enc, dec, isAadhaar, isPan, idHash, page, inr, fmtDate };
