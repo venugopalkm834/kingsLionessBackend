@@ -34,8 +34,11 @@ const errorHandler = (err, req, res, next) => {
   if (status === 500) console.error(err);
   res.status(status).json({ message: status === 500 ? (process.env.NODE_ENV === 'production' ? 'Server error' : 'Server error: ' + err.message) : err.message });
 };
+// UPLOAD_DIR lets a hosted server keep uploads on a persistent disk (see DEPLOY.md). Default: ./uploads
+const uploadDir = process.env.UPLOAD_DIR || path.join(__dirname, '../../uploads');
+require('fs').mkdirSync(uploadDir, { recursive: true });
 const store = multer.diskStorage({
-  destination: path.join(__dirname, '../../uploads'),
+  destination: uploadDir,
   filename: (req, f, cb) => cb(null, crypto.randomBytes(12).toString('hex') + path.extname(f.originalname || '').toLowerCase().replace(/[^.a-z0-9]/g, '')),
 });
 const upload = multer({ storage: store, limits: { fileSize: 5 * 1024 * 1024 },
