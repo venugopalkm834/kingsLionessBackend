@@ -148,9 +148,8 @@ r.get('/wallet/lookup', asyncH(async (req, res) => {
   const u = await findRecipient(req, req.query.by === 'mobile' ? 'mobile' : 'userId', req.query.value);
   res.json({ name: u.name, userId: u.userId, mobile: u.mobile ? `******${String(u.mobile).slice(-4)}` : '' });
 }));
-// Transfers: only EARNED income can be sent, and every transfer waits for admin approval.
-// The amount is held (debited) from the sender when requested; the recipient is credited when an admin approves;
-// a rejection refunds the sender in full.
+// Transfers: only EARNED income can be sent. It goes straight to the other user, with no admin approval.
+// Debit and credit happen in one database transaction. Without a replica set (no transactions) the debit is refunded if the credit fails.
 r.post('/wallet/transfers', validate(z.object({ by: z.enum(['userId', 'mobile', 'walletId']).default('userId'), value: z.string().optional(), walletId: z.string().optional(), source: z.enum(['principal', 'earned']).default('earned'), amount: amt, note: z.string().max(200).optional() })), asyncH(async (req, res) => {
   const { amount, note, source } = req.body; const by = req.body.by; const value = req.body.value || req.body.walletId; const key = idem(req);
   if (source !== 'earned') throw new HttpError(400, 'Principal cannot be transferred. Only earned income can be transferred.');
@@ -158,14 +157,24 @@ r.post('/wallet/transfers', validate(z.object({ by: z.enum(['userId', 'mobile', 
   const to = await findRecipient(req, by, value);
   const t = await withTx(async (s) => {
     const reference = ids.txn('TRF');
-    const [tr] = await Transfer.create([{ reference, from: req.user._id, to: to._id, fromWalletId: req.user.walletId, toWalletId: to.walletId, amount, source: 'earned', note, status: 'pending', idemKey: key }], { session: s });
-    await debit(s, { userId: req.user._id, amount, policy: 'earned', type: 'transfer_out', note: `To ${to.userId} (awaiting admin approval)`, relatedId: reference });
+    const [tr] = await Transfer.create([{ reference, from: req.user._id, to: to._id, fromWalletId: req.user.walletId, toWalletId: to.walletId, amount, source: 'earned', note, status: 'completed', idemKey: key }], { session: s });
+    await debit(s, { userId: req.user._id, amount, policy: 'earned', type: 'transfer_out', note: `To ${to.userId} (earned income)`, relatedId: reference });
+    try {
+      await credit(s, { userId: to._id, amount, bucket: 'earned', type: 'transfer_in', note: `From ${req.user.userId} (earned income)`, relatedId: reference });
+    } catch (e) {
+      if (!s) { // no transaction to roll back: give the sender's money back by hand
+        await credit(null, { userId: req.user._id, amount, bucket: 'earned', type: 'transfer_refund', note: 'Transfer failed, refunded', relatedId: reference }).catch(() => {});
+        await Transfer.updateOne({ _id: tr._id }, { status: 'rejected', remarks: 'Failed, refunded' }).catch(() => {});
+      }
+      throw e;
+    }
+    await Wallet.updateOne({ user: req.user._id }, { $inc: { totalTransfers: amount } }, { session: s });
+    await notify(s, to._id, 'Funds received', `${inr(amount)} from ${req.user.name} (${req.user.userId})`, '/wallet');
     return tr;
   });
-  await notifyAdmin('Transfer request', `${req.user.name} → ${to.name} (${to.userId}) ${inr(amount)}`, '/admin/transfers');
   res.status(201).json({ ...t.toObject(), recipientName: to.name, toUserId: to.userId, fromWalletId: undefined, toWalletId: undefined });
 }));
-r.get('/wallet/transfers', asyncH(async (req, res) => { const { p, l, skip } = page(req.query); const f = { $or: [{ from: req.user._id }, { to: req.user._id, status: 'completed' }] }; // a pending transfer is not shown to the recipient yet
+r.get('/wallet/transfers', asyncH(async (req, res) => { const { p, l, skip } = page(req.query); const f = { $or: [{ from: req.user._id }, { to: req.user._id, status: 'completed' }] }; // older transfers that were still pending are not shown to the recipient
   const [rows, total] = await Promise.all([Transfer.find(f).populate('from to', 'name userId').sort({ createdAt: -1 }).skip(skip).limit(l), Transfer.countDocuments(f)]);
   res.json({ items: rows.map((t) => ({ ...t.toObject(), fromWalletId: undefined, toWalletId: undefined, direction: String(t.from._id) === String(req.user._id) ? 'sent' : 'received' })), total, page: p, limit: l }); }));
 r.get('/wallet/monthly-returns', paged(MonthlyReturn, (req) => ({ user: req.user._id }), { month: -1 }));
