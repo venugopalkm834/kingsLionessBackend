@@ -338,7 +338,7 @@ r.get('/users/:id/kyc', asyncH(async (req, res) => {
   await audit(req.user._id, 'user.kyc_view', u.userId, null, null, req.ip);
   res.json({ aadhaar: u.aadhaarEnc ? dec(u.aadhaarEnc) : null, pan: u.panEnc ? dec(u.panEnc) : null });
 }));
-r.get('/notifications/unread', asyncH(async (req, res) => res.json({ count: await M.Notification.countDocuments({ forAdmin: true, read: false }) })));
+r.get('/notifications/unread', asyncH(async (req, res) => { const f = { forAdmin: true, read: false }; const [count, latest] = await Promise.all([M.Notification.countDocuments(f), M.Notification.findOne(f).sort({ createdAt: -1 }).select('title body link')]); res.json({ count, latest }); }));
 r.get('/notifications', asyncH(async (req, res) => res.json(await M.Notification.find({ forAdmin: true }).sort({ createdAt: -1 }).limit(50))));
 r.post('/notifications/read-all', asyncH(async (req, res) => { await M.Notification.updateMany({ forAdmin: true, read: false }, { read: true }); res.json({ ok: true }); }));
 module.exports = r;

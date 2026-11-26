@@ -228,7 +228,7 @@ r.delete('/nominee', asyncH(async (req, res) => { req.user.nominee = undefined; 
 
 // ---------------- notifications / profile ----------------
 r.get('/notifications', asyncH(async (req, res) => res.json(await Notification.find({ user: req.user._id }).sort({ createdAt: -1 }).limit(50))));
-r.get('/notifications/unread', asyncH(async (req, res) => res.json({ count: await Notification.countDocuments({ user: req.user._id, read: false }) })));
+r.get('/notifications/unread', asyncH(async (req, res) => { const f = { user: req.user._id, read: false }; const [count, latest] = await Promise.all([Notification.countDocuments(f), Notification.findOne(f).sort({ createdAt: -1 }).select('title body link')]); res.json({ count, latest }); }));
 r.post('/notifications/read-all', asyncH(async (req, res) => { await Notification.updateMany({ user: req.user._id, read: false }, { read: true }); res.json({ ok: true }); }));
 r.post('/profile/avatar', upload.single('avatar'), asyncH(async (req, res) => {
   if (!req.file || !req.file.mimetype.startsWith('image/')) throw new HttpError(400, 'Please choose an image file');
