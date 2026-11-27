@@ -7,6 +7,42 @@ const { getSettings, credit, debit, notify, audit, dailyPercent, lockInfo, lockD
 const { runDailyReturns, runMonthEnd } = require('../utils/returns');
 const { approveCommission, addCommission, depositCommission } = require('../utils/referral');
 r.use(auth, role('admin'));
+// ---- Notification sound (applies to every user and admin) ----
+const multer = require('multer');
+const soundUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 600 * 1024 } });
+const SOUND_PRESETS = ['ding', 'beep', 'chime', 'coin'];
+const audioMime = (b) => { // decided from the file's own first bytes, not from its name
+  if (b.length < 12) return null;
+  if (b.slice(0, 4).toString() === 'RIFF' && b.slice(8, 12).toString() === 'WAVE') return 'audio/wav';
+  if (b.slice(0, 4).toString() === 'OggS') return 'audio/ogg';
+  if (b.slice(0, 3).toString() === 'ID3' || (b[0] === 0xff && (b[1] & 0xe0) === 0xe0)) return 'audio/mpeg';
+  if (b.slice(4, 8).toString() === 'ftyp') return 'audio/mp4';
+  return null;
+};
+const soundDoc = async () => (await M.ApplicationSetting.findOne({ key: 'sound' }).lean())?.data || {};
+const soundOut = (d) => ({ preset: d.preset === 'custom' && !d.mime ? 'ding' : (d.preset || 'ding'), custom: d.mime ? { name: d.name, size: d.size, mime: d.mime } : null, v: d.v || 0 });
+r.get('/sound', asyncH(async (req, res) => res.json(soundOut(await soundDoc()))));
+r.put('/sound', validate(z.object({ preset: z.enum(['ding', 'beep', 'chime', 'coin', 'custom']) })), asyncH(async (req, res) => {
+  const d = await soundDoc();
+  if (req.body.preset === 'custom' && !d.mime) throw new HttpError(400, 'Upload a sound file first');
+  const nd = { ...d, preset: req.body.preset, v: Date.now() };
+  await M.ApplicationSetting.findOneAndUpdate({ key: 'sound' }, { key: 'sound', data: nd }, { upsert: true });
+  await audit(req.user._id, 'settings.sound', 'sound', req.body.preset, null, req.ip);
+  res.json(soundOut(nd));
+}));
+r.post('/sound/upload', soundUpload.single('file'), asyncH(async (req, res) => {
+  if (!req.file) throw new HttpError(400, 'Choose a sound file (MP3, WAV, OGG or M4A, up to 600 KB)');
+  const mime = audioMime(req.file.buffer); if (!mime) throw new HttpError(400, 'That file is not a supported audio file. Use MP3, WAV, OGG or M4A.');
+  const nd = { preset: 'custom', mime, b64: req.file.buffer.toString('base64'), name: String(req.file.originalname || 'sound').slice(0, 80), size: req.file.size, v: Date.now() };
+  await M.ApplicationSetting.findOneAndUpdate({ key: 'sound' }, { key: 'sound', data: nd }, { upsert: true });
+  await audit(req.user._id, 'settings.sound_upload', 'sound', nd.name, { size: nd.size }, req.ip);
+  res.status(201).json(soundOut(nd));
+}));
+r.delete('/sound/custom', asyncH(async (req, res) => {
+  const d = await soundDoc(); const nd = { preset: d.preset === 'custom' ? 'ding' : (SOUND_PRESETS.includes(d.preset) ? d.preset : 'ding'), v: Date.now() };
+  await M.ApplicationSetting.findOneAndUpdate({ key: 'sound' }, { key: 'sound', data: nd }, { upsert: true });
+  res.json(soundOut(nd));
+}));
 
 const rx = (s) => new RegExp(String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
 const range = (q, f = 'createdAt') => (q.from || q.to ? { [f]: { ...(q.from && { $gte: new Date(q.from) }), ...(q.to && { $lte: new Date(q.to + 'T23:59:59') }) } } : {});

@@ -7,9 +7,18 @@ const { getSettings, credit, debit, notify, notifyAdmin, dailyPercent, baseField
 
 // ---------------- public ----------------
 r.get('/services', asyncH(async (req, res) => res.json(await Service.find({ active: true }).sort({ order: 1 }))));
+// Notification sound chosen by the admin: a built-in preset, or an uploaded audio file kept in the database (so it survives redeploys).
+const SOUND_PRESETS = ['ding', 'beep', 'chime', 'coin'];
+const soundConfig = async () => { const d = (await require('../models').ApplicationSetting.findOne({ key: 'sound' }).select('data.preset data.v data.mime').lean())?.data || {}; const custom = d.preset === 'custom' && !!d.mime; return { preset: custom ? 'custom' : SOUND_PRESETS.includes(d.preset) ? d.preset : 'ding', v: d.v || 0 }; };
+r.get('/sound/custom', asyncH(async (req, res) => {
+  const d = (await require('../models').ApplicationSetting.findOne({ key: 'sound' }).lean())?.data;
+  if (!d?.b64) return res.status(404).json({ error: 'No custom sound' });
+  res.set({ 'Content-Type': d.mime, 'Cache-Control': 'public, max-age=86400', 'X-Content-Type-Options': 'nosniff' }).send(Buffer.from(d.b64, 'base64'));
+}));
 r.get('/program-info', asyncH(async (req, res) => {
   const s = await getSettings();
   res.json({
+    sound: await soundConfig(),
     returns: { enabled: s.returns.enabled, inputMode: s.returns.inputMode, monthlyPercent: s.returns.monthlyPercent, dailyPercent: dailyPercent(s.returns), daysBasis: s.returns.daysBasis, base: s.returns.base, minBalance: s.returns.minBalance, conditions: s.returns.conditions },
     principalReturn: { enabled: s.principalReturn.enabled, percent: s.principalReturn.percent, minPrincipal: s.principalReturn.minPrincipal, conditions: s.principalReturn.conditions },
     referral: { enabled: s.referral.enabled, bookingEnabled: s.referral.bookingEnabled, percent: s.referral.percent, eligibleActivity: s.referral.eligibleActivity, deposit: s.referral.deposit, earning: s.referral.earning },
